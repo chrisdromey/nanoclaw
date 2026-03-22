@@ -54,12 +54,22 @@
     - Known upstream issue: qwibitai/nanoclaw#1216
     - Root cause: Claude Code server-side sessions expire, but NanoClaw never clears the stale session ID from SQLite — every subsequent message fails with "No conversation found with session ID"
     - Fix: added `deleteSession()` to `db.ts`, updated `index.ts` error handler to detect the specific error and clear the stale session so the next message starts a fresh session automatically
+15. **Deal Hunter DB Tool Server (MCP) built (2026-03-22)**
+    - SQLite database with 7 tables: hunts, offers, search_queries, hunt_offers, prices, evaluations, alerts
+    - MCP server at `container/agent-runner/src/deal-hunter-mcp.ts` using `better-sqlite3` (native bindings)
+    - 13 coarse-grained tools: manage_hunt, get_hunt, get_hunt_summary, get_market_overview, record_offer, update_offer, get_offer, record_evaluation, record_alert, record_alert_response, get_prices, record_search, search_evaluations
+    - DB file persists in group folder at `/workspace/group/deal-hunter.db` (accessible by both container MCP and future host-side watcher)
+    - WAL mode enabled for concurrent read/write access
+    - Registered unconditionally as `deal-hunter-db` MCP server in agent-runner (tools available as `mcp__deal-hunter-db__*`)
+    - Added `better-sqlite3` to container deps, `python3 make g++` to Dockerfile for native compilation
+    - Container rebuilt, agent-runner source cache cleared, service restarted
 
 ## Next Steps
 
-1. **Write deal-hunter skill and group CLAUDE.md** — using templates from implementation plan
-2. **Configure scheduled tasks** — periodic eBay polling (30min cadence)
-3. **Test end-to-end** — conversation → hunt creation → search → alert
+1. **Write deal-hunter skills and group CLAUDE.md** — requirements-discovery, price-baselining, listing-evaluation, hunt-management, documentation skills per system architecture
+2. **Build the Watcher Service** — independent polling service with scheduler, eBay adapter, change detector, agent notifier
+3. **Configure scheduled tasks** — periodic eBay polling (30min cadence)
+4. **Test end-to-end** — conversation → hunt creation → watcher polls → agent evaluates → alert via Telegram
 
 ## Incidents
 

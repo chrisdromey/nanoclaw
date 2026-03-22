@@ -408,7 +408,8 @@ async function runQuery(
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
-        'mcp__ebay-api__*'
+        'mcp__ebay-api__*',
+        'mcp__deal-hunter-db__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -433,6 +434,13 @@ async function runQuery(
             },
           },
         } : {}),
+        'deal-hunter-db': {
+          command: 'node',
+          args: [path.join(__dirname, 'deal-hunter-mcp.js')],
+          env: {
+            DEAL_HUNTER_DB_PATH: '/workspace/group/deal-hunter.db',
+          },
+        },
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
