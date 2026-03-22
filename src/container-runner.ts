@@ -12,6 +12,8 @@ import {
   CONTAINER_TIMEOUT,
   CREDENTIAL_PROXY_PORT,
   DATA_DIR,
+  EBAY_CLIENT_ID,
+  EBAY_CLIENT_SECRET,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
@@ -236,6 +238,12 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Pass eBay API credentials for the eBay MCP server
+  if (EBAY_CLIENT_ID && EBAY_CLIENT_SECRET) {
+    args.push('-e', `EBAY_CLIENT_ID=${EBAY_CLIENT_ID}`);
+    args.push('-e', `EBAY_CLIENT_SECRET=${EBAY_CLIENT_SECRET}`);
   }
 
   // Runtime-specific args for host gateway resolution

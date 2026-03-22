@@ -42,6 +42,10 @@ COPY agent-runner/package*.json ./
 # Install dependencies
 RUN npm install
 
+# Copy eBay MCP wrapper script
+COPY scripts/ebay-mcp-wrapper.sh /usr/local/bin/ebay-mcp-wrapper.sh
+RUN chmod +x /usr/local/bin/ebay-mcp-wrapper.sh
+
 # Copy source code
 COPY agent-runner/ ./
 

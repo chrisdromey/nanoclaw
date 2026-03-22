@@ -6,6 +6,7 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -31,6 +32,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  deleteSession,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -43,6 +45,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { initBotPool } from './channels/telegram.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -331,6 +334,15 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
+      // Detect stale session IDs and clear them so the next attempt starts fresh
+      if (output.error?.includes('No conversation found with session ID')) {
+        logger.warn(
+          { group: group.name, folder: group.folder },
+          'Stale session detected — clearing session ID for fresh start',
+        );
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
       logger.error(
         { group: group.name, error: output.error },
         'Container agent error',
@@ -594,6 +606,11 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  // Initialize Telegram bot pool for agent swarm (if configured)
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
   }
 
   // Start subsystems (independently of connection handler)
