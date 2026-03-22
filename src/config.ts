@@ -6,7 +6,13 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets (API keys, tokens) are NOT read here — they are loaded only
 // by the credential proxy (credential-proxy.ts), never exposed to containers.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'TELEGRAM_BOT_POOL', 'EBAY_CLIENT_ID', 'EBAY_CLIENT_SECRET']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'TELEGRAM_BOT_POOL',
+  'EBAY_CLIENT_ID',
+  'EBAY_CLIENT_SECRET',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -68,14 +74,20 @@ export const TRIGGER_PATTERN = new RegExp(
 );
 
 // Bot pool for agent teams (Telegram swarm): comma-separated tokens
-export const TELEGRAM_BOT_POOL = (process.env.TELEGRAM_BOT_POOL || envConfig.TELEGRAM_BOT_POOL || '')
+export const TELEGRAM_BOT_POOL = (
+  process.env.TELEGRAM_BOT_POOL ||
+  envConfig.TELEGRAM_BOT_POOL ||
+  ''
+)
   .split(',')
   .map((t) => t.trim())
   .filter(Boolean);
 
 // eBay API credentials (passed to agent containers for MCP server)
-export const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || envConfig.EBAY_CLIENT_ID || '';
-export const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || envConfig.EBAY_CLIENT_SECRET || '';
+export const EBAY_CLIENT_ID =
+  process.env.EBAY_CLIENT_ID || envConfig.EBAY_CLIENT_ID || '';
+export const EBAY_CLIENT_SECRET =
+  process.env.EBAY_CLIENT_SECRET || envConfig.EBAY_CLIENT_SECRET || '';
 
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
