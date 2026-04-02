@@ -139,6 +139,17 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  // Add last_used column to sessions if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN last_used TEXT`);
+    // Backfill: set existing sessions to now so they don't expire immediately
+    database.exec(
+      `UPDATE sessions SET last_used = '${new Date().toISOString()}'`,
+    );
+  } catch {
+    /* column already exists */
+  }
 }
 
 export function initDatabase(): void {
@@ -513,32 +524,42 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
-  const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
+export interface SessionEntry {
+  session_id: string;
+  last_used: string | null;
+}
+
+export function getSession(groupFolder: string): SessionEntry | undefined {
+  return db
+    .prepare('SELECT session_id, last_used FROM sessions WHERE group_folder = ?')
+    .get(groupFolder) as SessionEntry | undefined;
 }
 
 export function setSession(groupFolder: string, sessionId: string): void {
+  const now = new Date().toISOString();
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    'INSERT OR REPLACE INTO sessions (group_folder, session_id, last_used) VALUES (?, ?, ?)',
+  ).run(groupFolder, sessionId, now);
 }
 
 export function deleteSession(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
-export function getAllSessions(): Record<string, string> {
+export function getAllSessions(): Record<string, SessionEntry> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
-  const result: Record<string, string> = {};
+    .prepare('SELECT group_folder, session_id, last_used FROM sessions')
+    .all() as Array<{ group_folder: string; session_id: string; last_used: string | null }>;
+  const result: Record<string, SessionEntry> = {};
   for (const row of rows) {
-    result[row.group_folder] = row.session_id;
+    result[row.group_folder] = { session_id: row.session_id, last_used: row.last_used };
   }
   return result;
+}
+
+export function isSessionExpired(lastUsed: string | null, ttlMs: number): boolean {
+  if (!lastUsed) return true;
+  return Date.now() - new Date(lastUsed).getTime() > ttlMs;
 }
 
 // --- Registered group accessors ---

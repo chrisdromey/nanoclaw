@@ -15,6 +15,7 @@ import { z } from 'zod';
 import Database from 'better-sqlite3';
 
 // --- DB Initialization ---
+// Schema is owned by the watcher service. This MCP server only reads/writes.
 
 const DB_PATH =
   process.env.DEAL_HUNTER_DB_PATH || '/workspace/group/deal-hunter.db';
@@ -24,101 +25,15 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS hunts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'closed')),
-    criteria TEXT NOT NULL DEFAULT '{}',
-    search_terms TEXT NOT NULL DEFAULT '[]',
-    cadence_minutes INTEGER NOT NULL DEFAULT 60,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    closed_at TEXT,
-    close_reason TEXT
-  );
-
-  CREATE TABLE IF NOT EXISTS offers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    url TEXT,
-    seller TEXT,
-    seller_rating REAL,
-    condition TEXT,
-    specs_extracted TEXT DEFAULT '{}',
-    buying_format TEXT,
-    auction_end_time TEXT,
-    bid_count INTEGER,
-    watching INTEGER NOT NULL DEFAULT 0,
-    watch_conditions TEXT,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'ended', 'removed', 'sold')),
-    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(source, source_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS search_queries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    hunt_id INTEGER NOT NULL REFERENCES hunts(id),
-    source TEXT NOT NULL,
-    terms TEXT NOT NULL,
-    result_count INTEGER DEFAULT 0,
-    new_offer_count INTEGER DEFAULT 0,
-    relevant_count INTEGER DEFAULT 0,
-    searched_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS hunt_offers (
-    hunt_id INTEGER NOT NULL REFERENCES hunts(id),
-    offer_id INTEGER NOT NULL REFERENCES offers(id),
-    search_query_id INTEGER REFERENCES search_queries(id),
-    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new', 'evaluated', 'watching', 'dismissed')),
-    first_associated_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (hunt_id, offer_id)
-  );
-
-  CREATE TABLE IF NOT EXISTS prices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    offer_id INTEGER NOT NULL REFERENCES offers(id),
-    price REAL NOT NULL,
-    shipping REAL,
-    currency TEXT NOT NULL DEFAULT 'GBP',
-    total_landed_gbp REAL,
-    observed_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS evaluations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    offer_id INTEGER NOT NULL REFERENCES offers(id),
-    hunt_id INTEGER NOT NULL REFERENCES hunts(id),
-    decision TEXT NOT NULL CHECK(decision IN ('alert', 'skip', 'watch')),
-    reasoning TEXT,
-    evaluated_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    offer_id INTEGER NOT NULL REFERENCES offers(id),
-    hunt_id INTEGER NOT NULL REFERENCES hunts(id),
-    urgency TEXT NOT NULL DEFAULT 'medium' CHECK(urgency IN ('high', 'medium', 'low')),
-    message_sent TEXT,
-    alerted_at TEXT NOT NULL DEFAULT (datetime('now')),
-    user_response TEXT,
-    feedback_extracted TEXT,
-    responded_at TEXT
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_offers_source ON offers(source, source_id);
-  CREATE INDEX IF NOT EXISTS idx_offers_watching ON offers(watching) WHERE watching = 1;
-  CREATE INDEX IF NOT EXISTS idx_offers_status ON offers(status);
-  CREATE INDEX IF NOT EXISTS idx_hunt_offers_status ON hunt_offers(hunt_id, status);
-  CREATE INDEX IF NOT EXISTS idx_prices_offer ON prices(offer_id, observed_at);
-  CREATE INDEX IF NOT EXISTS idx_evaluations_hunt ON evaluations(hunt_id);
-  CREATE INDEX IF NOT EXISTS idx_evaluations_offer ON evaluations(offer_id);
-  CREATE INDEX IF NOT EXISTS idx_alerts_hunt ON alerts(hunt_id, alerted_at);
-  CREATE INDEX IF NOT EXISTS idx_search_queries_hunt ON search_queries(hunt_id, searched_at);
-`);
+// Verify the watcher has created the schema
+const tables = db
+  .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+  .all()
+  .map((r) => (r as { name: string }).name);
+if (!tables.includes('hunts')) {
+  console.error('deal-hunter.db has no schema. The watcher service must be running to create it.');
+  process.exit(1);
+}
 
 // --- Helpers ---
 
@@ -148,21 +63,25 @@ server.tool(
     hunt_id: z.number().optional().describe('Required for update/pause/resume/close'),
     name: z.string().optional().describe('Hunt name (required for create)'),
     criteria: z.string().optional().describe('JSON string of criteria object'),
-    search_terms: z.string().optional().describe('JSON string of search terms array'),
+    search_terms: z.string().optional().describe('JSON string of search terms. Simple format: ["term1", "term2"]. Per-term categories: [{"terms": "term1", "category_ids": "1244"}, {"terms": "term2"}]. Per-term category_ids override hunt-level category_ids.'),
     cadence_minutes: z.number().optional(),
+    monitoring: z.boolean().optional().describe('Enable/disable watcher monitoring for this hunt (default true). Set false during research/baselining.'),
+    category_ids: z.string().optional().describe('Comma-separated eBay category IDs to filter watcher searches (e.g. "179" for PC Desktops). Acts as the default for all search terms. Individual terms can override via per-term category_ids in search_terms.'),
     close_reason: z.string().optional().describe('Reason for closing (bought, changed_mind, etc.)'),
   },
-  async ({ action, hunt_id, name, criteria, search_terms, cadence_minutes, close_reason }) => {
+  async ({ action, hunt_id, name, criteria, search_terms, cadence_minutes, monitoring, category_ids, close_reason }) => {
     if (action === 'create') {
       if (!name) return errorResult('name is required for create');
       const result = db.prepare(`
-        INSERT INTO hunts (name, criteria, search_terms, cadence_minutes)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO hunts (name, criteria, search_terms, cadence_minutes, monitoring, category_ids)
+        VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         name,
         criteria || '{}',
         search_terms || '[]',
         cadence_minutes || 60,
+        monitoring === false ? 0 : 1,
+        category_ids || null,
       );
       const hunt = db.prepare('SELECT * FROM hunts WHERE id = ?').get(result.lastInsertRowid);
       return jsonResult({ action: 'created', hunt });
@@ -179,6 +98,8 @@ server.tool(
       if (criteria !== undefined) { sets.push('criteria = ?'); params.push(criteria); }
       if (search_terms !== undefined) { sets.push('search_terms = ?'); params.push(search_terms); }
       if (cadence_minutes !== undefined) { sets.push('cadence_minutes = ?'); params.push(cadence_minutes); }
+      if (monitoring !== undefined) { sets.push('monitoring = ?'); params.push(monitoring ? 1 : 0); }
+      if (category_ids !== undefined) { sets.push('category_ids = ?'); params.push(category_ids || null); }
       if (sets.length === 0) return errorResult('Nothing to update');
       params.push(hunt_id);
       db.prepare(`UPDATE hunts SET ${sets.join(', ')} WHERE id = ?`).run(...params);
@@ -251,17 +172,18 @@ server.tool(
 // ============================================================
 server.tool(
   'get_hunt_summary',
-  'Comprehensive session startup summary for a hunt: active watches, new unevaluated offers, recent price changes, search stats, and recent feedback.',
+  'Comprehensive session startup summary for a hunt. Pass `since` (ISO timestamp) to filter to changes after that time — useful for event-driven and daily review runs. Omit for full summary.',
   {
     hunt_id: z.number(),
+    since: z.string().optional().describe('ISO timestamp — only return changes after this time. Omit for full summary.'),
   },
-  async ({ hunt_id }) => {
+  async ({ hunt_id, since }) => {
     const hunt = db.prepare('SELECT * FROM hunts WHERE id = ?').get(hunt_id);
     if (!hunt) return errorResult('Hunt not found: ' + hunt_id);
 
-    const newOffers = db.prepare(`
-      SELECT COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? AND status = 'new'
-    `).get(hunt_id) as any;
+    const newOffers = since
+      ? db.prepare(`SELECT COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? AND status = 'new' AND first_associated_at > ?`).get(hunt_id, since) as any
+      : db.prepare(`SELECT COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? AND status = 'new'`).get(hunt_id) as any;
 
     const watchedOffers = db.prepare(`
       SELECT o.*, ho.status as hunt_offer_status,
@@ -271,6 +193,8 @@ server.tool(
       WHERE ho.hunt_id = ? AND o.watching = 1
     `).all(hunt_id);
 
+    const priceTimeFilter = since ? '?' : "datetime('now', '-7 days')";
+    const priceParams = since ? [hunt_id, since] : [hunt_id];
     const recentPriceChanges = db.prepare(`
       SELECT o.id, o.title, o.source, o.source_id,
         p1.total_landed_gbp as current_price,
@@ -285,10 +209,22 @@ server.tool(
         AND p1.observed_at = (SELECT MAX(observed_at) FROM prices WHERE offer_id = o.id)
         AND p2.observed_at = (SELECT MAX(observed_at) FROM prices WHERE offer_id = o.id AND observed_at < p1.observed_at)
         AND p1.total_landed_gbp != p2.total_landed_gbp
-        AND p1.observed_at > datetime('now', '-7 days')
+        AND p1.observed_at > ${priceTimeFilter}
       ORDER BY p1.observed_at DESC
       LIMIT 20
-    `).all(hunt_id);
+    `).all(...priceParams);
+
+    // Status changes — offers that ended, were removed, or sold since the given time
+    const statusChanges = since
+      ? db.prepare(`
+          SELECT o.id, o.title, o.source_id, o.status, o.last_status_change,
+            ho.status as hunt_offer_status
+          FROM offers o
+          JOIN hunt_offers ho ON ho.offer_id = o.id
+          WHERE ho.hunt_id = ? AND o.last_status_change > ?
+          ORDER BY o.last_status_change DESC
+        `).all(hunt_id, since)
+      : [];
 
     const recentSearches = db.prepare(`
       SELECT * FROM search_queries WHERE hunt_id = ? ORDER BY searched_at DESC LIMIT 5
@@ -311,6 +247,7 @@ server.tool(
       new_offer_count: (newOffers as any).count,
       watched_offers: watchedOffers,
       recent_price_changes: recentPriceChanges,
+      status_changes: statusChanges,
       recent_searches: recentSearches,
       recent_feedback: recentFeedback,
       offer_counts: offerCounts,
@@ -319,7 +256,25 @@ server.tool(
 );
 
 // ============================================================
-// Tool 4: get_market_overview
+// Tool 4: mark_hunt_reviewed
+// ============================================================
+server.tool(
+  'mark_hunt_reviewed',
+  'Mark a hunt as reviewed (updates last_reviewed_at). Call at the end of each daily review.',
+  {
+    hunt_id: z.number(),
+  },
+  async ({ hunt_id }) => {
+    const existing = db.prepare('SELECT id FROM hunts WHERE id = ?').get(hunt_id);
+    if (!existing) return errorResult('Hunt not found: ' + hunt_id);
+    db.prepare("UPDATE hunts SET last_reviewed_at = datetime('now') WHERE id = ?").run(hunt_id);
+    const hunt = db.prepare('SELECT * FROM hunts WHERE id = ?').get(hunt_id);
+    return jsonResult({ hunt });
+  },
+);
+
+// ============================================================
+// Tool 5: get_market_overview
 // ============================================================
 server.tool(
   'get_market_overview',
@@ -539,7 +494,10 @@ server.tool(
     const sets: string[] = [];
     const params: unknown[] = [];
     if (args.status) { sets.push('status = ?'); params.push(args.status); }
-    if (args.watching !== undefined) { sets.push('watching = ?'); params.push(args.watching ? 1 : 0); }
+    if (args.watching !== undefined) {
+      sets.push('watching = ?'); params.push(args.watching ? 1 : 0);
+      if (!args.watching) { sets.push("notified_thresholds = '[]'"); }
+    }
     if (args.watch_conditions !== undefined) { sets.push('watch_conditions = ?'); params.push(args.watch_conditions); }
 
     if (sets.length > 0) {
@@ -575,7 +533,8 @@ server.tool(
     min_price: z.number().optional().describe('Min latest total_landed_gbp'),
     max_price: z.number().optional().describe('Max latest total_landed_gbp'),
     watching_only: z.boolean().optional(),
-    limit: z.number().optional().describe('Max results (default 50)'),
+    limit: z.number().optional().describe('Max results (default 50, max 200)'),
+    offset: z.number().optional().describe('Skip this many results for pagination (default 0)'),
   },
   async (args) => {
     // Single offer mode
@@ -625,10 +584,11 @@ server.tool(
     }
 
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-    const limit = args.limit || 50;
+    const limit = Math.min(args.limit || 50, 200);
+    const offset = args.offset || 0;
 
-    let query = `SELECT o.* FROM offers o ${joins.join(' ')} ${whereClause} ORDER BY o.last_seen_at DESC LIMIT ?`;
-    params.push(limit);
+    let query = `SELECT o.* FROM offers o ${joins.join(' ')} ${whereClause} ORDER BY o.last_seen_at DESC LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
 
     let offers = db.prepare(query).all(...params) as any[];
 
@@ -653,7 +613,7 @@ server.tool(
       return { ...o, latest_price: latestPrice || null };
     });
 
-    return jsonResult({ offers: results, count: results.length });
+    return jsonResult({ offers: results, count: results.length, offset, limit, has_more: results.length === limit });
   },
 );
 
@@ -896,6 +856,175 @@ server.tool(
     `).all(...params, limit);
 
     return jsonResult({ evaluations, count: evaluations.length });
+  },
+);
+
+// ============================================================
+// Tool 14: create_market_segment
+// ============================================================
+server.tool(
+  'create_market_segment',
+  'Create or update a market segment for a hunt. Segments group items by variant/category for price comparison (e.g. "M90q Gen 1 i5", "Budget tier under £150"). Upserts by (hunt_id, name).',
+  {
+    hunt_id: z.number(),
+    name: z.string().describe('Short descriptive name for this grouping'),
+    description: z.string().optional().describe('What defines this segment'),
+    tags: z.string().optional().describe('JSON array of attribute tags, e.g. \'["i5-10500T", "16GB", "DDR4"]\''),
+    filter_patterns: z.string().optional().describe('JSON object of title patterns, condition filters, price hints for future auto-classification'),
+    price_low: z.number().optional().describe('Good deal threshold — below this is cheap'),
+    price_mid: z.number().optional().describe('Typical/fair market price'),
+    price_high: z.number().optional().describe('Overpriced threshold — above this is too much'),
+    sample_size: z.number().optional().describe('How many data points informed these tiers'),
+    confidence: z.enum(['HIGH', 'MEDIUM', 'LOW']).optional().describe('HIGH: 20+ consistent points, MEDIUM: 10-20 or some variance, LOW: <10 or highly variable'),
+    notes: z.string().optional().describe('Market observations, gotchas, caveats'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+
+    const existing = db.prepare(
+      'SELECT * FROM market_segments WHERE hunt_id = ? AND name = ?',
+    ).get(args.hunt_id, args.name) as Record<string, unknown> | undefined;
+
+    if (existing) {
+      const sets: string[] = ["updated_at = datetime('now')"];
+      const params: unknown[] = [];
+      if (args.description !== undefined) { sets.push('description = ?'); params.push(args.description); }
+      if (args.tags !== undefined) { sets.push('tags = ?'); params.push(args.tags); }
+      if (args.filter_patterns !== undefined) { sets.push('filter_patterns = ?'); params.push(args.filter_patterns); }
+      if (args.price_low !== undefined) { sets.push('price_low = ?'); params.push(args.price_low); }
+      if (args.price_mid !== undefined) { sets.push('price_mid = ?'); params.push(args.price_mid); }
+      if (args.price_high !== undefined) { sets.push('price_high = ?'); params.push(args.price_high); }
+      if (args.sample_size !== undefined) { sets.push('sample_size = ?'); params.push(args.sample_size); }
+      if (args.confidence !== undefined) { sets.push('confidence = ?'); params.push(args.confidence); }
+      if (args.notes !== undefined) { sets.push('notes = ?'); params.push(args.notes); }
+      params.push(existing.id);
+      db.prepare(`UPDATE market_segments SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+      const updated = db.prepare('SELECT * FROM market_segments WHERE id = ?').get(existing.id);
+      return jsonResult({ action: 'updated', segment: updated });
+    } else {
+      const result = db.prepare(`
+        INSERT INTO market_segments (hunt_id, name, description, tags, filter_patterns, price_low, price_mid, price_high, sample_size, confidence, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        args.hunt_id, args.name, args.description || null,
+        args.tags || '[]', args.filter_patterns || '{}',
+        args.price_low ?? null, args.price_mid ?? null, args.price_high ?? null,
+        args.sample_size ?? 0, args.confidence || 'LOW', args.notes || null,
+      );
+      const segment = db.prepare('SELECT * FROM market_segments WHERE id = ?').get(result.lastInsertRowid);
+      return jsonResult({ action: 'created', segment });
+    }
+  },
+);
+
+// ============================================================
+// Tool 15: record_baseline_price
+// ============================================================
+server.tool(
+  'record_baseline_price',
+  'Record one or more baseline price data points for a hunt. These are research data (sold listings, observed active prices) — not live offer tracking. Use after calling get_sold_prices or reviewing active listings.',
+  {
+    hunt_id: z.number(),
+    segment_id: z.number().optional().describe('Segment ID to associate with'),
+    segment_name: z.string().optional().describe('Alternative to segment_id: resolve by name within the hunt'),
+    items: z.array(z.object({
+      source_type: z.enum(['sold', 'active', 'auction_completed']),
+      title: z.string(),
+      price: z.number(),
+      shipping: z.number().optional(),
+      total_landed_gbp: z.number().optional(),
+      condition: z.string().optional(),
+      sold_date: z.string().optional().describe('ISO date when item sold'),
+      source_url: z.string().optional(),
+      source_item_id: z.string().optional(),
+      tags: z.string().optional().describe('JSON array of attribute tags'),
+    })).describe('Array of price data points to record'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+
+    let segmentId: number | null = args.segment_id ?? null;
+    if (!segmentId && args.segment_name) {
+      const seg = db.prepare(
+        'SELECT id FROM market_segments WHERE hunt_id = ? AND name = ?',
+      ).get(args.hunt_id, args.segment_name) as { id: number } | undefined;
+      if (!seg) return errorResult(`Segment "${args.segment_name}" not found for hunt ${args.hunt_id}`);
+      segmentId = seg.id;
+    }
+
+    const insert = db.prepare(`
+      INSERT INTO baseline_prices (segment_id, hunt_id, source_type, title, price, shipping, total_landed_gbp, condition, sold_date, source_url, source_item_id, tags)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const recordAll = db.transaction(() => {
+      for (const item of args.items) {
+        insert.run(
+          segmentId, args.hunt_id, item.source_type, item.title, item.price,
+          item.shipping ?? null, item.total_landed_gbp ?? null,
+          item.condition || null, item.sold_date || null,
+          item.source_url || null, item.source_item_id || null,
+          item.tags || '[]',
+        );
+      }
+    });
+    recordAll();
+
+    return jsonResult({ recorded: args.items.length, segment_id: segmentId });
+  },
+);
+
+// ============================================================
+// Tool 16: get_baseline_summary
+// ============================================================
+server.tool(
+  'get_baseline_summary',
+  'Get baseline research summary for a hunt: segments with price tiers, data point counts, and latest research date.',
+  {
+    hunt_id: z.number(),
+    segment_id: z.number().optional().describe('Get summary for a specific segment only'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id, name FROM hunts WHERE id = ?').get(args.hunt_id) as { id: number; name: string } | undefined;
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+
+    const segmentCondition = args.segment_id ? 'AND ms.id = ?' : '';
+    const segmentParams = args.segment_id ? [args.hunt_id, args.segment_id] : [args.hunt_id];
+
+    const segments = db.prepare(`
+      SELECT ms.*,
+        COALESCE(bp.data_point_count, 0) as data_point_count,
+        COALESCE(bp.sold_count, 0) as sold_count,
+        COALESCE(bp.active_count, 0) as active_count,
+        bp.earliest_data,
+        bp.latest_data
+      FROM market_segments ms
+      LEFT JOIN (
+        SELECT segment_id,
+          COUNT(*) as data_point_count,
+          SUM(CASE WHEN source_type = 'sold' THEN 1 ELSE 0 END) as sold_count,
+          SUM(CASE WHEN source_type = 'active' THEN 1 ELSE 0 END) as active_count,
+          MIN(observed_at) as earliest_data,
+          MAX(observed_at) as latest_data
+        FROM baseline_prices
+        GROUP BY segment_id
+      ) bp ON bp.segment_id = ms.id
+      WHERE ms.hunt_id = ? ${segmentCondition}
+      ORDER BY ms.created_at ASC
+    `).all(...segmentParams);
+
+    const unclassified = db.prepare(
+      'SELECT COUNT(*) as count FROM baseline_prices WHERE hunt_id = ? AND segment_id IS NULL',
+    ).get(args.hunt_id) as { count: number };
+
+    return jsonResult({
+      hunt_id: args.hunt_id,
+      hunt_name: hunt.name,
+      segments,
+      unclassified_count: unclassified.count,
+    });
   },
 );
 

@@ -70,6 +70,16 @@ systemctl --user restart nanoclaw
 
 **WhatsApp not connecting after upgrade:** WhatsApp is now a separate skill, not bundled in core. Run `/add-whatsapp` (or `npx tsx scripts/apply-skill.ts .claude/skills/add-whatsapp && npm run build`) to install it. Existing auth credentials and groups are preserved.
 
+## Deploying Agent-Runner Changes
+
+When you modify files in `container/agent-runner/src/`, three steps are needed:
+
+1. `./container/build.sh` — rebuild the container image
+2. `rm -rf data/sessions/*/agent-runner-src/` — clear the per-group source cache
+3. Restart NanoClaw (or wait for the next container to spawn)
+
+**Why:** Each group gets a writable copy of `agent-runner/src/` on first container start (`data/sessions/{group}/agent-runner-src/`). This copy is never auto-updated — it's a feature allowing per-group customization. If you skip step 2, existing groups will keep running the old code even after rebuilding the image.
+
 ## Container Build Cache
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.

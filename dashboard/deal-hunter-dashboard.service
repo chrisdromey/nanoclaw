@@ -1,0 +1,15 @@
+[Unit]
+Description=Deal Hunter Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nanoclaw/dashboard
+ExecStart=/usr/bin/node dist/server/index.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=PORT=3456
+
+[Install]
+WantedBy=multi-user.target

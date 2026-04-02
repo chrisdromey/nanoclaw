@@ -6,6 +6,7 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  SESSION_TTL_MS,
   TELEGRAM_BOT_POOL,
   TIMEZONE,
   TRIGGER_PATTERN,
@@ -33,6 +34,8 @@ import {
   getAllSessions,
   getAllTasks,
   deleteSession,
+  isSessionExpired,
+  type SessionEntry,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -67,7 +70,7 @@ import { logger } from './logger.js';
 export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
-let sessions: Record<string, string> = {};
+let sessions: Record<string, SessionEntry> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
@@ -274,7 +277,20 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sessionEntry = sessions[group.folder];
+  let sessionId: string | undefined;
+  if (sessionEntry) {
+    if (isSessionExpired(sessionEntry.last_used, SESSION_TTL_MS)) {
+      logger.info(
+        { group: group.name, folder: group.folder },
+        'Session expired (TTL), starting fresh',
+      );
+      delete sessions[group.folder];
+      deleteSession(group.folder);
+    } else {
+      sessionId = sessionEntry.session_id;
+    }
+  }
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -305,7 +321,7 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
+          sessions[group.folder] = { session_id: output.newSessionId, last_used: new Date().toISOString() };
           setSession(group.folder, output.newSessionId);
         }
         await onOutput(output);
@@ -329,7 +345,7 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
+      sessions[group.folder] = { session_id: output.newSessionId, last_used: new Date().toISOString() };
       setSession(group.folder, output.newSessionId);
     }
 

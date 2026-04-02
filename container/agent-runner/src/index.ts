@@ -19,6 +19,8 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -57,6 +59,7 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const COMPACT_THRESHOLD_TOKENS = parseInt(process.env.COMPACT_THRESHOLD_TOKENS || '150000', 10);
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -324,6 +327,32 @@ function waitForIpcMessage(): Promise<string | null> {
 }
 
 /**
+ * Fetch an eBay OAuth application token using client credentials.
+ * Returns the access_token string, or empty string on failure.
+ */
+async function fetchEbayToken(clientId: string, clientSecret: string): Promise<string> {
+  try {
+    const resp = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope',
+    });
+    if (!resp.ok) {
+      log(`eBay OAuth failed: ${resp.status} ${resp.statusText}`);
+      return '';
+    }
+    const data = await resp.json() as { access_token?: string };
+    return data.access_token || '';
+  } catch (err) {
+    log(`eBay OAuth error: ${err}`);
+    return '';
+  }
+}
+
+/**
  * Run a single query and stream results via writeOutput.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
  * allowing agent teams subagents to run to completion.
@@ -365,6 +394,8 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  let cumulativeInputTokens = 0;
+  let compactRequested = false;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -389,6 +420,15 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Fetch eBay OAuth token for the custom search MCP (if credentials are available)
+  let ebayAccessToken = '';
+  if (process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET) {
+    ebayAccessToken = await fetchEbayToken(process.env.EBAY_CLIENT_ID, process.env.EBAY_CLIENT_SECRET);
+    if (ebayAccessToken) {
+      log('eBay OAuth token fetched for ebay-search MCP');
+    }
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -409,7 +449,9 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__ebay-api__*',
-        'mcp__deal-hunter-db__*'
+        'mcp__ebay-search__*',
+        'mcp__deal-hunter-db__*',
+        'mcp__sold-data__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -433,6 +475,15 @@ async function runQuery(
               EBAY_CLIENT_SECRET: process.env.EBAY_CLIENT_SECRET,
             },
           },
+          ...(ebayAccessToken ? {
+            'ebay-search': {
+              command: 'node',
+              args: [path.join(__dirname, 'ebay-search-mcp.js')],
+              env: {
+                EBAY_ACCESS_TOKEN: ebayAccessToken,
+              },
+            },
+          } : {}),
         } : {}),
         'deal-hunter-db': {
           command: 'node',
@@ -440,6 +491,10 @@ async function runQuery(
           env: {
             DEAL_HUNTER_DB_PATH: '/workspace/group/deal-hunter.db',
           },
+        },
+        'sold-data': {
+          command: 'node',
+          args: [path.join(__dirname, 'sold-data-mcp.js')],
         },
       },
       hooks: {
@@ -465,8 +520,29 @@ async function runQuery(
       log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
     }
 
+    if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+      const compactMsg = message as { compact_metadata?: { pre_tokens?: number } };
+      log(`Compact boundary: pre_tokens=${compactMsg.compact_metadata?.pre_tokens ?? 'unknown'}`);
+      cumulativeInputTokens = 0;
+      compactRequested = false;
+    }
+
     if (message.type === 'result') {
       resultCount++;
+
+      // Track cumulative input tokens for auto-compact
+      const resultMsg = message as { modelUsage?: Record<string, { inputTokens?: number }> };
+      if (resultMsg.modelUsage) {
+        for (const usage of Object.values(resultMsg.modelUsage)) {
+          cumulativeInputTokens += usage.inputTokens || 0;
+        }
+      }
+      if (cumulativeInputTokens > COMPACT_THRESHOLD_TOKENS && !compactRequested) {
+        log(`Auto-compact: ${cumulativeInputTokens} input tokens exceed threshold of ${COMPACT_THRESHOLD_TOKENS}`);
+        compactRequested = true;
+        stream.push('/compact');
+      }
+
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
@@ -503,7 +579,6 @@ async function main(): Promise<void> {
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;

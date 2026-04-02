@@ -1,0 +1,18 @@
+[Unit]
+Description=Deal Hunter Watcher Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/nanoclaw/watcher/dist/index.js
+WorkingDirectory=/opt/nanoclaw
+Restart=always
+RestartSec=10
+KillMode=process
+Environment=HOME=/root
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/root/.local/bin
+StandardOutput=append:/opt/nanoclaw/logs/watcher.log
+StandardError=append:/opt/nanoclaw/logs/watcher.error.log
+
+[Install]
+WantedBy=multi-user.target

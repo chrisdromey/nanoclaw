@@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, SESSION_TTL_MS, TIMEZONE } from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -12,7 +12,9 @@ import {
   getAllTasks,
   getDueTasks,
   getTaskById,
+  isSessionExpired,
   logTaskRun,
+  type SessionEntry,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
@@ -64,7 +66,7 @@ export function computeNextRun(task: ScheduledTask): string | null {
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
-  getSessions: () => Record<string, string>;
+  getSessions: () => Record<string, SessionEntry>;
   queue: GroupQueue;
   onProcess: (
     groupJid: string,
@@ -149,10 +151,15 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
-  // For group context mode, use the group's current session
+  // For group context mode, use the group's current session (if not expired)
   const sessions = deps.getSessions();
-  const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  let sessionId: string | undefined;
+  if (task.context_mode === 'group') {
+    const entry = sessions[task.group_folder];
+    if (entry && !isSessionExpired(entry.last_used, SESSION_TTL_MS)) {
+      sessionId = entry.session_id;
+    }
+  }
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
