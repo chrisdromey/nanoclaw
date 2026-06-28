@@ -1,0 +1,46 @@
+{
+  "url": "https://www.autotrader.co.uk/car-details/202604291986125?journey=FEATURED_LISTING_JOURNEY&sort=relevance&twcs=true&searchId=20fdf5e6-a80e-40c8-88bd-f96e3e44e916&make=AUDI&model=A4&page=1&postcode=LE11AB&price-to=15000&advertising-location=at_cars&fromsra=&backLinkQueryParams=postcode%3DLE11AB%26make%3DAUDI%26model%3DA4%26price-to%3D15000%26flrfc%3D1&calc-deposit=1450&calc-term=48&calc-mileage=10000&calc-selected-product=HP",
+  "title": "2019 Audi A4",
+  "price": "£14,500",
+  "spec": {
+    "mileage": "57,651 miles",
+    "registration": "2019 (69 reg)",
+    "fuel": "Petrol",
+    "body": "Saloon",
+    "engine": "2.0L",
+    "transmission": "Manual",
+    "doors": "4",
+    "seats": "5",
+    "colour": "White",
+    "year": "2019 (69 reg)"
+  },
+  "sellerName": "Hilton Garage Ltd",
+  "sellerType": "trade",
+  "dealerRating": "4.3",
+  "postcode": "M1 7BL",
+  "cityText": "Derby",
+  "distanceText": "27 miles away",
+  "description": "DescriptionLast serviced on the 04.03.2025 at 54024 miles.\n\nIntroducing the stunning Audi A4, a true masterpiece on wheels. With only 58,000 miles on the clock and boasting a sleek White finish, this car is sure to turn heads wherever you go.\n\nThis Audi A4 is not just a car, it's a statement. With its 2.0 A4 S Line 35 TFSI engine, you can expect a smooth and powerful driving experience every time you hit the road. Whether you're cruising down the motorway or navigating city streets, this car delivers performance and style in equal measure.\n\nDespite having had 3 owners, this Audi A4 has been meticulously cared for and is in impeccable condition. From its luxurious interior to its eye-catching exterior, every detail has been crafted to perfection.\n\nDon't miss your chance to own this exceptional Audi A4. Visit us today and experience the thrill of driving a true icon.\n\nCLICK + COLLECT & HOME DELIVERY AVAILABLE\nReserve your vehicle online today and our team will contact you quickly to guide you through the process. We also offer competitive part exchange valuations, with collection available for your convenience.\n\nBrowse our full supermarket stock of over 2,000 vehicles on our website - new arrivals daily, so don’t miss out.\n\nAll vehicles undergo essential safety checks and/or a Pre-Delivery Inspection (PDI) on arrival. Test drives can take place once initial checks are completed, with full preparation carried out prior to handover for total peace of mind.\n\nSecure this vehicle today with a fully refundable holding deposit. If it does not meet our standards or isn’t what you expected, you’ll receive an immediate refund - no hassle, no pressure.\n\nPlease note: Vehicle specifications are supplied via a third-party provider. While we aim for accuracy, Hilton Garage cannot guarantee all details are correct. If a specific feature is important to you, please contact our team and we’ll be happy to confirm.\n\nPrice Promise: Find the same vehicle cheaper elsewhere and we’ll refund ",
+  "imageCount": 8,
+  "imageSample": [
+    "https://m.atcdn.co.uk/a/media/w800/0af1b105b0724c54a5a94354b1bcce5b.jpg",
+    "https://m.atcdn.co.uk/a/media/w600/d4c58e04a8ca4abbade8332f638c703c.jpg",
+    "https://m.atcdn.co.uk/a/media/w600/0e8bc10cb90c402684e741bb722774d3.jpg",
+    "https://m.atcdn.co.uk/a/media/w600/1f33282cc9ce42c6badbb35958daca2d.jpg",
+    "https://m.atcdn.co.uk/a/media/w600/4398cd458adf48188ff94e5d217fcdfe.jpg"
+  ],
+  "hasNextData": false,
+  "jsonLd": [],
+  "xhr_endpoints": [
+    {
+      "url": "https://cmpv2.autotrader.co.uk/consent/tcfv2/vendor-list/latest-version?siteId=2512&accountId=741&hasCsp=true",
+      "status": 200,
+      "ct": "application/json; charset=utf-8"
+    },
+    {
+      "url": "https://cmpv2.autotrader.co.uk/consent/tcfv2/consent/v2/data-pipeline/pv-data?hasCsp=true&cacheHash=500185785487832972c77c",
+      "status": 200,
+      "ct": "application/json; charset=utf-8"
+    }
+  ]
+}

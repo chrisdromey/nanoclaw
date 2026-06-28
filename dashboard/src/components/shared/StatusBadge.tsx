@@ -1,6 +1,6 @@
 import { cn } from '@/lib/utils';
 
-type BadgeVariant =
+export type BadgeVariant =
   | 'active'
   | 'paused'
   | 'closed'
@@ -14,6 +14,8 @@ type BadgeVariant =
   | 'high'
   | 'medium'
   | 'low'
+  | 'info'
+  | 'warning'
   | 'success'
   | 'error'
   | 'running'
@@ -38,6 +40,9 @@ const variantStyles: Record<BadgeVariant, string> = {
   high: 'bg-danger text-white',
   medium: 'border border-warning text-warning',
   low: 'border border-zinc-600 text-zinc-400',
+  // Semantic
+  info: 'bg-info-muted text-info',
+  warning: 'bg-warning-muted text-warning',
   // System
   success: 'bg-success-muted text-success',
   error: 'bg-danger-muted text-danger',

@@ -105,6 +105,16 @@ in the DB; this is the readable version with context.]
 
 ---
 
+## Run-Level Logging (hunt_log DB table)
+
+Run-level data (what the agent evaluated each invocation, search quality observations, per-batch synthesis) is stored in the `hunt_log` database table — **not** in hunt markdown files. This keeps hunt files focused on durable reference material while allowing unbounded activity history without file bloat.
+
+The agent calls `log_hunt_run` at the end of each invocation and `get_hunt_history(hunt_id, since, until)` to review past activity. The history tool merges agent narrative summaries with aggregated mechanical data (searches, evaluations, alerts, status changes) from other tables.
+
+Hunt files should **never** contain a `## Run Log` section. Strategy-level observations that emerge from evaluations belong in `## Strategy Notes` (updated in-place), not appended chronologically.
+
+---
+
 ## What This Replaces
 
 The earlier skills architecture doc referenced:

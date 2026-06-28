@@ -25,12 +25,25 @@ Research is reactive to market findings, not a prerequisite to starting a hunt. 
 Before spawning anything, understand what's already known:
 
 1. Read the hunt file (`references/hunts/{hunt-name}.md`) if it exists
-2. Read `references/product-knowledge/` — what facts are on record?
+2. Read `references/product-knowledge/` — what facts are on record? For cars, the trim/feature knowledge bases live in `references/product-knowledge/cars/{make}-{model}.md` — read any that exist before re-deriving trim facts, and use `/car-spec-research` to build or extend them rather than gathering trim/feature data ad hoc here.
 3. Read `references/research/{hunt-name}/` — has previous research been done?
 4. Identify knowledge gaps:
    - What's stated as fact but unverified?
    - What product categories or brands haven't been explored?
    - What compatibility or technical questions are open?
+
+## Challenge the brief
+
+Before scoping research tasks, step back and question the framing. The user (or your own earlier analysis) may have anchored on a specific product or spec without evaluating whether it's actually the best solution to the underlying problem. This is the most common research failure — going deep on the obvious option while missing a simpler, cheaper, or better-fit alternative.
+
+Ask yourself:
+
+1. **What problem is actually being solved?** Not what product was mentioned — what outcome does the user need? What are the real constraints vs. assumed ones?
+2. **Are the stated specs justified?** If the brief names a specific tier, capacity, or feature, ask why. Is that grounded in measured need, or is it a guess that hardened into a requirement? If you can't justify a spec from the actual use case, flag it.
+3. **What would a domain expert recommend?** Someone knowledgeable would often suggest something simpler, cheaper, or different than what the buyer walked in asking about. Think about what features have outsized value for *this specific use case* that haven't been considered.
+4. **What's being left on the table?** Lower-tier products, different product categories, refurbished options, or entirely different approaches. The best deal isn't always the cheapest version of the expensive thing — sometimes it's a different thing altogether.
+
+If this step confirms the brief is well-justified, move on. If it reveals gaps or assumptions, adjust your research scope to include alternatives. At minimum, ensure at least one research thread explores options the user hasn't already named.
 
 ## Scoping — swarm or solo?
 

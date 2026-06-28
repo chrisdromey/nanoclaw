@@ -64,11 +64,38 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # restart
 systemctl --user start nanoclaw
 systemctl --user stop nanoclaw
 systemctl --user restart nanoclaw
+
+# Deal Hunter services (system-level, not --user)
+systemctl restart deal-hunter-watcher.service
+systemctl restart deal-hunter-dashboard.service
 ```
 
 ## Troubleshooting
 
 **WhatsApp not connecting after upgrade:** WhatsApp is now a separate skill, not bundled in core. Run `/add-whatsapp` (or `npx tsx scripts/apply-skill.ts .claude/skills/add-whatsapp && npm run build`) to install it. Existing auth credentials and groups are preserved.
+
+## Deal Hunter
+
+Automated multi-vertical, multi-source deal-finding system. Currently supports `computers` (eBay) and `cars` (AutoTrader). The pipeline is vertical-agnostic — one flow, with the per-vertical "how" in specialist skills and `config/verticals.yml`. Adding a vertical on an existing source is config + skills (no code); a new source needs a `SourceAdapter`. **See [docs/delhunter/deal-hunter-architecture.md](docs/delhunter/deal-hunter-architecture.md) for the model, the seam contracts, and the add-a-vertical / add-a-source runbooks.**
+
+| Component | Service | Purpose |
+|-----------|---------|---------|
+| Watcher | `deal-hunter-watcher.service` | Polls all configured sources, triggers agent evaluations |
+| Dashboard | `deal-hunter-dashboard.service` | Web UI for hunts, offers, activity |
+| Agent MCP | `container/agent-runner/src/deal-hunter-mcp.ts` | DB tools for the container agent |
+
+**Verticals:** declared in `config/verticals.yml` (the single source of truth — sources, cadence, criteria_schema, sourcing/evaluator skills, recon_tool, knowledge_base_path, and an optional `agent` block). The watcher parses it via `verticals.ts` and mirrors resolved capabilities into a `verticals` DB table at startup; the container agent reads them through the `get_vertical`/`list_verticals` MCP tools (verticals.yml isn't mounted in-container). `src/verticals/loader.ts` is a lockstep copy kept for the orchestrator (currently unused) — keep the two in sync when adding fields. Evaluator sub-agents are built from the `agent` blocks by `container/agent-runner/src/vertical-agents.ts`.
+
+**Source adapters:** live in `watcher/src/sources/<name>/`. Each implements the `SourceAdapter` interface (`watcher/src/sources/types.ts`). The eBay adapter is in `sources/ebay/`; AutoTrader in `sources/autotrader/`. The dashboard has parallel adapters in `dashboard/server/sources/`.
+
+**Database:** `groups/telegram_main/deal-hunter.db` (SQLite). Schema is managed by the watcher's `ensureSchema()` in `watcher/src/db.ts` — runs at watcher startup.
+
+**Hunt files:** `groups/telegram_main/references/hunts/*.md` — stable reference material only (requirements, price research, strategy notes). Hunt files are not eBay-specific; cars hunts live here too. Run-level logging goes to the `hunt_log` DB table via `log_hunt_run` MCP tool.
+
+**Key principle:** If you add/change DB schema in `watcher/src/db.ts`, you must rebuild and restart the watcher for `ensureSchema()` to run:
+```bash
+cd watcher && npx tsc && systemctl restart deal-hunter-watcher.service
+```
 
 ## Deploying Agent-Runner Changes
 

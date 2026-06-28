@@ -1,0 +1,33 @@
+URL: https://www.autotrader.co.uk/car-search?postcode=LE11AB&make=AUDI&model=A4&price-to=15000&radius=50&maximum-mileage=80000&fuel-type=Diesel
+Status: 200 OK
+Final URL: https://www.autotrader.co.uk/car-search?postcode=LE11AB&make=AUDI&model=A4&price-to=15000&radius=50&maximum-mileage=80000&fuel-type=Diesel
+Bytes: 87564
+Elapsed: 57ms
+
+Response headers:
+cache-control: max-age=60
+cf-cache-status: DYNAMIC
+cf-ray: a1286a58187feb17-MAN
+connection: keep-alive
+content-encoding: gzip
+content-security-policy: upgrade-insecure-requests; report-uri https://app.csp-report-receiver.prod.k8.atcloud.io/api/csp/report-uri; report-to autotrader-csp;
+content-type: text/html;charset=utf-8
+date: Sun, 28 Jun 2026 00:01:10 GMT
+link: <https://apm-assets.prod.atcdn.co.uk/elastic-apm-rum.umd.min.js>; rel="prefetch"
+referrer-policy: origin-when-cross-origin
+reporting-endpoints: autotrader-csp="https://app.csp-report-receiver.prod.k8.atcloud.io/api/csp/report-to"
+server: cloudflare
+set-cookie: bucket=desktop; Domain=.autotrader.co.uk; path=/;
+set-cookie: abTestGroups=; Path=/; Expires=Sat, 27 Jun 2026 00:01:10 GMT
+set-cookie: userid=ID=db73000f-985b-46bb-aa8d-7b3499e06fcc; Path=/; Expires=Mon, 28 Jun 2027 00:01:10 GMT; Domain=.autotrader.co.uk; Secure
+set-cookie: user=STATUS=0&HASH=7d28ac7b1303793c9bd90148ec90a08e&PR=&ID=db73000f-985b-46bb-aa8d-7b3499e06fcc; Path=/; Expires=Mon, 28 Jun 2027 00:01:10 GMT; Domain=.autotrader.co.uk; Secure
+set-cookie: __cf_bm=PajOyg5H7Z2Ce.h0Ix30eKGoXrLAriBrwn3Sho0M5AI-1782604870.4130893-1.0.1.1-YiZhUAoq6zIY39I.l4uTMjoRy6BLhpOGD0jnZwTPCYxaVdK62Dl1bP_vZp0LsAAU15lJ3Ssd3g6KFxuygDvqu.E_snHDj20_aKYGafsd4AK5QbEPkrMLQBEn2zMp2L.I; HttpOnly; SameSite=None; Secure; Path=/; Domain=www.autotrader.co.uk; Expires=Sun, 28 Jun 2026 00:31:10 GMT
+strict-transport-security: max-age=31536000
+transfer-encoding: chunked
+vary: Accept-Encoding, accept-encoding, Accept-Encoding
+x-at-service: sauron-search-results-app
+x-atcloud-response-service: consumer-gateway
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-request-id: a1286a58187feb17
+x-xss-protection: 1; mode=block

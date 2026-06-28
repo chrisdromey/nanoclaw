@@ -27,10 +27,18 @@ export function matchToSegment(
       continue;
     }
 
-    const score = tags.reduce(
+    // Score from tags
+    let score = tags.reduce(
       (s, tag) => s + (titleLower.includes(tag.toLowerCase()) ? 1 : 0),
       0,
     );
+
+    // Also match against segment name words (e.g. "Ryzen 5 Pro 5650G")
+    // so offers match even if tags only contain spec descriptors
+    const nameWords = segment.name.toLowerCase().split(/\s+/).filter((w) => w.length >= 2);
+    for (const word of nameWords) {
+      if (titleLower.includes(word)) score++;
+    }
 
     if (score > 0 && (!best || score > best.score)) {
       best = { segment, score };

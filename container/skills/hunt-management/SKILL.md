@@ -20,21 +20,40 @@ Read `HUNT-PHILOSOPHY.md` (in this skill directory) for the foundational approac
 ## Orientation
 
 1. `mcp__deal-hunter-db__get_hunt` (no ID) — list all hunts for the full picture
-2. Check for dependencies between hunts
+2. `mcp__deal-hunter-db__get_vertical` for this hunt's vertical — its `sourcing_skill` (how to
+   design search terms and filters for the source), `criteria_schema` (what criteria the hunt
+   accepts), and `knowledge_base_path` (whether the vertical expects reference knowledge)
+3. Check for dependencies between hunts
 
 ## Workflows
 
 ### Create
 
 1. Take criteria from the requirements-discovery conversation
-2. `mcp__deal-hunter-db__manage_hunt` with action `create`, criteria, search terms, cadence
-3. Define search terms broadly — multiple product names, not just one
-4. Set `monitoring: true` to start learning from the market immediately. Only set `monitoring: false` if you have a specific reason (e.g., search terms are completely untested and might waste API budget on noise — but you should have tested them with ad-hoc search during requirements discovery).
-5. Create the hunt markdown file at `references/hunts/{hunt-name}.md` with requirements summary
-6. Set `category_ids` based on categories you saw during requirements-discovery market searches (e.g. "PC Desktops & All-in-Ones" = `179`). If you didn't note categories, check a few search results now.
-7. Run `/price-baselining` alongside monitoring — it doesn't need to complete first, but it **must happen**. Every hunt needs market segments and baseline prices recorded to the database. Without them, the dashboard prices page is empty and your evaluation judgements aren't grounded in real market data. Never skip this because you think you already know the prices.
-8. Confirm to user: what's being watched, how often, what criteria
-9. This is a living document. Come back and update search terms, criteria, and strategy as you learn from monitoring and evaluation.
+2. `mcp__deal-hunter-db__manage_hunt` with action `create`: criteria, search terms, cadence,
+   and the `vertical` (plus `sources` if it differs from the vertical default). The watcher
+   derives the poll cadence from the vertical unless you set `poll_interval_minutes`.
+3. Define search terms broadly — design them per the vertical's `sourcing_skill` (term count,
+   filtering, and budget are source-specific).
+4. Set `monitoring: true` to start learning from the market immediately. Only set
+   `monitoring: false` if you have a specific reason (e.g. search terms are completely
+   untested) — but you should have tested them with ad-hoc search during requirements
+   discovery.
+5. Create the hunt markdown file at `references/hunts/{hunt-name}.md` with a requirements summary.
+6. **Run `/price-baselining` via the `market-researcher` sub-agent — this is mandatory, not
+   optional.** A hunt without market segments is broken: the dashboard "vs Base" column will
+   be empty and evaluations won't be grounded in real market data. Do not move on until you
+   have recorded at least one segment with a baseline price. If unsure about segments, start
+   with a single broad segment and refine later — but never leave a hunt with zero segments.
+   Informal price notes in the hunt markdown are NOT a substitute for structured DB segments.
+7. **If the vertical declares a `knowledge_base_path` and the brief is feature-led, the
+   knowledge base must exist before monitoring is enabled** — the evaluator verifies must-have
+   features against it and will otherwise silently skip the check. The vertical's
+   `sourcing_skill` covers how to build it. (If the user already knows the exact product and
+   the brief isn't feature-led, a knowledge base is recommended but not blocking.)
+8. Confirm to the user: what's being watched, how often, what criteria.
+9. This is a living document. Come back and update search terms, criteria, and strategy as you
+   learn from monitoring and evaluation.
 
 ### Update
 
@@ -60,27 +79,22 @@ Read `HUNT-PHILOSOPHY.md` (in this skill directory) for the foundational approac
 
 A hunt has a `monitoring` flag that controls whether the background watcher polls its search terms for new listings.
 
-- **`monitoring: true`** — the watcher automatically searches eBay using the hunt's search terms at the configured cadence, records new offers, and triggers an event-driven invocation so you can evaluate them
-- **`monitoring: false`** — the hunt exists for tracking and organization but the watcher ignores it. Use this during research, baselining, or when refining search terms.
-- **Pausing** a hunt (`status: 'paused'`) also stops monitoring — the watcher only queries active hunts.
+- **`monitoring: true`** — the watcher automatically searches the hunt's sources using its
+  search terms at the configured cadence, records new offers, and triggers an event-driven
+  invocation so you can evaluate them.
+- **`monitoring: false`** — the hunt exists for tracking and organisation but the watcher
+  ignores it. Use this during research, baselining, or when refining search terms.
+- **Pausing** a hunt (`status: 'paused'`) also stops monitoring — the watcher only queries
+  active hunts.
 
 Toggle monitoring with: `manage_hunt(action: 'update', hunt_id: X, monitoring: true/false)`
 
-Ad-hoc searches via `mcp__ebay-search__search_ebay` are never monitored — they're just research tools. Only hunt search terms get polled by the watcher.
-
-## Search Term Design
-
-Each search term costs 3 eBay API calls per poll (one per buying format: auction, buy-it-now, best-offer). These run repeatedly at the hunt's cadence, and the daily API budget across all hunts is 5000 calls. Keep search terms to the minimum needed:
-
-- eBay search is fuzzy — "lenovo m90q" already returns Gen 1, Gen 2, and Gen 3 results. You don't need separate terms for each variant of the same product.
-- Overlapping terms waste API budget and return mostly the same listings (duplicates are handled in the DB, but the API calls are still spent).
-- Test terms with ad-hoc search first (`mcp__ebay-search__search_ebay`) during baselining to see what each returns before committing them to the hunt.
-- Always set `category_ids` on the hunt to filter watcher searches to relevant eBay categories. Without it, a search for "lenovo m90q" returns rack mounts, VESA brackets, heatsinks, and accessories alongside actual PCs. Discover the right category during baselining — look at the `categories` field on relevant search results (e.g. "PC Desktops & All-in-Ones" is category `179`).
+Ad-hoc searches are never monitored — they're just research tools. Only hunt search terms get polled by the watcher.
 
 ## Rules
 
 - Always confirm with the user before closing a hunt
 - When creating, explain clearly what will be monitored and how often
 - Start monitoring early — a broad hunt learning from the market beats a perfect hunt that hasn't started
-- Keep search terms to the minimum needed — each one costs API credits on every poll cycle
+- Keep search terms to the minimum needed — polling costs add up; the vertical's `sourcing_skill` explains the source's cost model
 - Hunts are iterative — creating one is not a commitment to fixed criteria. Update search terms, criteria, and strategy freely as market data comes in

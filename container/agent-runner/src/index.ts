@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { buildEvaluatorAgents } from './vertical-agents.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -404,6 +405,22 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
+  const feedbackInstructions = `
+## Feedback on tools & systems
+
+Surface problems instead of working around them silently. If you hit any of these, tell the user in the same response:
+
+- A tool errors, returns unexpected results, or behaves inconsistently with its documentation
+- A skill's workflow doesn't match how the tools actually behave
+- You're missing context, reference data, or a tool/capability that would help you do a better job
+- You have an idea for improving the workflow or user experience
+
+If something fails, say so — don't retry silently. Say what went wrong and what you're trying next.`;
+
+  const systemPromptAppend = globalClaudeMd
+    ? `${globalClaudeMd}\n${feedbackInstructions}`
+    : feedbackInstructions;
+
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
@@ -429,6 +446,12 @@ async function runQuery(
     }
   }
 
+  // Per-vertical evaluator sub-agents, built from the verticals the watcher mirrored into the
+  // DB. Adding a vertical with an `agent` block in config/verticals.yml adds its evaluator here
+  // with no code change. market-researcher and generic-deal-evaluator stay hand-defined below.
+  const evaluatorAgents = buildEvaluatorAgents(ebayAccessToken);
+  log(`Built ${Object.keys(evaluatorAgents).length} vertical evaluator agents: ${Object.keys(evaluatorAgents).join(', ') || '(none — is the watcher running?)'}`);
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -436,22 +459,30 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
-        : undefined,
+      systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
       allowedTools: [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
         'WebSearch', 'WebFetch',
         'Task', 'TaskOutput', 'TaskStop',
+        'Agent',
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        // Orchestrator tool scoping (reduce tool bloat):
+        // - deal-hunter-db: always needed (hunt/offer state, routing, dispatch).
+        // - eBay tools (ebay-api/ebay-search/sold-data): kept because orchestrator-level
+        //   skills run them INLINE — requirements-discovery & hunt-management do eBay market
+        //   recon via ebay-search; /research uses ebay-api/ebay-search/sold-data directly.
+        // - autotrader-search: NOT exposed here. Every cars workflow is delegated to a scoped
+        //   sub-agent (cars-evaluator, market-researcher), so the orchestrator never calls it
+        //   directly. The server is still defined in mcpServers below so those sub-agents can
+        //   reference it by name.
         'mcp__ebay-api__*',
         'mcp__ebay-search__*',
         'mcp__deal-hunter-db__*',
-        'mcp__sold-data__*'
+        'mcp__sold-data__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -495,6 +526,75 @@ async function runQuery(
         'sold-data': {
           command: 'node',
           args: [path.join(__dirname, 'sold-data-mcp.js')],
+        },
+        // Cars vertical source. Defined here (not in the orchestrator's allowedTools) so the
+        // scoped sub-agents — cars-evaluator and market-researcher — can reference it by name.
+        // The runtime JS file is only loaded when a cars hunt actually runs.
+        'autotrader-search': {
+          command: 'node',
+          args: [path.join(__dirname, 'autotrader-search-mcp.js')],
+        },
+      },
+      agents: {
+        // Per-vertical evaluators (deal-evaluator, cars-evaluator, …) are built from
+        // config/verticals.yml — see buildEvaluatorAgents. market-researcher and
+        // generic-deal-evaluator are cross-vertical, so they stay hand-defined here.
+        ...evaluatorAgents,
+        'market-researcher': {
+          description: 'Researches market pricing and builds product knowledge for a hunt, recording market segments and baseline prices to the database. Delegate for price baselining, market analysis, building a product/trim knowledge base, or refreshing a stale baseline (>14 days).',
+          prompt: `You are a market research specialist serving every vertical.
+
+Resolve the hunt's vertical with get_vertical, then follow the price-baselining skill — it directs you to the vertical's sourcing skill for how to gather comparables, and you record segments and baseline prices the same way for every vertical. When a feature-led hunt needs product/trim knowledge that doesn't exist yet, build it via the knowledge-building skill the sourcing skill points you to.
+
+Key rules:
+- Do NOT message the user directly — you have no access to the nanoclaw MCP
+- Return a concise summary (under 500 words) of your research findings
+- Include: search terms used, segments identified, price ranges found, and any market observations
+- Record all structured data (market segments, baseline prices) to the database before returning
+- Write prose findings to the hunt file (and knowledge-base files) as the skills instruct`,
+          tools: [
+            'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+            'WebSearch', 'WebFetch',
+            'TodoWrite',
+            'mcp__deal-hunter-db__*',
+            'mcp__sold-data__*',
+            // Cross-vertical researcher: needs every source's search tools for baselining.
+            'mcp__autotrader-search__*',
+            ...(ebayAccessToken ? ['mcp__ebay-search__*'] : []),
+            ...(process.env.EBAY_CLIENT_ID ? ['mcp__ebay-api__*'] : []),
+          ],
+          model: 'sonnet',
+          skills: ['price-baselining', 'ebay-sourcing', 'cars-sourcing', 'car-spec-research'],
+          mcpServers: [
+            'deal-hunter-db',
+            'sold-data',
+            'autotrader-search',
+            ...(ebayAccessToken ? ['ebay-search'] : []),
+            ...(process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET ? ['ebay-api'] : []),
+          ],
+        },
+        'generic-deal-evaluator': {
+          description: 'Default deal evaluator for verticals without a bespoke skill. Use as fallback for T1 verticals (cookers, AC units, generic categories) where no vertical-specific evaluator exists.',
+          prompt: `You are a general-purpose deal evaluation specialist. Follow the generic-deal-evaluator skill instructions precisely.
+
+Key rules:
+- Do NOT message the user directly — you have no access to the nanoclaw MCP
+- Return a concise summary (under 500 words) of your evaluation findings
+- Include: what you evaluated, decisions (ALERT/WATCH/SKIP with reasons), comp baseline used, and any market observations
+- Record all evaluations to the database before returning
+- Keep notification format source-agnostic (no eBay-specific language)`,
+          tools: [
+            'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+            'TodoWrite',
+            'mcp__deal-hunter-db__*',
+            'mcp__sold-data__*',
+          ],
+          model: 'sonnet',
+          skills: ['generic-deal-evaluator'],
+          mcpServers: [
+            'deal-hunter-db',
+            'sold-data',
+          ],
         },
       },
       hooks: {

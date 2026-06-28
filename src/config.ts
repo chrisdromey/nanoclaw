@@ -21,6 +21,14 @@ export const ASSISTANT_HAS_OWN_NUMBER =
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
+// Tasks whose scheduled time was missed by more than this (e.g. the host was
+// powered off) are treated as stale: skipped rather than replayed on restart.
+// `once` tasks are dropped; `cron`/`interval` tasks roll forward to their next
+// future occurrence. Prevents a flood of obsolete runs after downtime.
+export const STALE_TASK_GRACE_MS = parseInt(
+  process.env.STALE_TASK_GRACE_MS || '3600000',
+  10,
+); // 1hr default
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
@@ -59,7 +67,10 @@ export const CREDENTIAL_PROXY_PORT = parseInt(
 );
 export const IPC_POLL_INTERVAL = 1000;
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
-export const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || '7200000', 10); // 2hr default — sessions older than this start fresh
+export const SESSION_TTL_MS = parseInt(
+  process.env.SESSION_TTL_MS || '7200000',
+  10,
+); // 2hr default — sessions older than this start fresh
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,

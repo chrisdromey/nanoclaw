@@ -32,7 +32,7 @@ export default function CommandPalette() {
   const navigate = useNavigate();
 
   const { data: hunts } = useQuery({
-    queryKey: queryKeys.hunts.all,
+    queryKey: queryKeys.hunts.all(),
     queryFn: () => apiGet<HuntSummary[]>('/hunts?status=all'),
     enabled: open,
   });

@@ -13,6 +13,10 @@ export interface Hunt {
   closed_at: string | null;
   close_reason: string | null;
   last_reviewed_at: string | null;
+  // Multi-vertical fields (Phase 1 schema addition)
+  vertical: string;
+  sources: string[]; // JSON array parsed to string[] by API
+  poll_interval_minutes: number | null;
 }
 
 export interface Offer {
@@ -23,11 +27,12 @@ export interface Offer {
   url: string | null;
   seller: string | null;
   seller_rating: number | null;
+  // eBay-flavoured fields — nullable; populated by eBay adapter, null for other sources
   condition: string | null;
-  specs_extracted: string; // JSON
   buying_format: string | null;
   auction_end_time: string | null;
   bid_count: number | null;
+  specs_extracted: string; // JSON
   watching: number;
   watch_conditions: string | null; // JSON
   status: 'active' | 'ended' | 'removed' | 'sold';
@@ -35,6 +40,13 @@ export interface Offer {
   last_seen_at: string;
   last_status_change: string | null;
   notified_thresholds: string | null; // JSON
+  thumbnail_url: string | null;
+  // Multi-vertical fields (Phase 1 schema addition)
+  vertical: string | null;
+  // vertical-specific extras (mileage, year, etc.). Stored as a JSON string in
+  // the DB but parsed to an object by every API endpoint (list + detail), so it
+  // is always an object on the client.
+  attributes: Record<string, unknown>;
 }
 
 export interface Price {
@@ -289,6 +301,7 @@ export interface HuntBaselineData {
     title: string;
     current_price: number | null;
     condition: string | null;
+    buying_format: string | null;
   }>;
 }
 
@@ -303,4 +316,29 @@ export interface TermEffectiveness {
   last_searched: string;
   sparkline: number[];
   stale: boolean;
+}
+
+export interface HuntLogEntry {
+  id: number;
+  hunt_id: number;
+  trigger: string;
+  summary: string;
+  offers_evaluated: number;
+  offers_alerted: number;
+  offers_watched: number;
+  offers_skipped: number;
+  logged_at: string;
+}
+
+export interface HuntDailyStat {
+  date: string;
+  runs: number;
+  evaluated: number;
+  alerted: number;
+  skipped: number;
+}
+
+export interface HuntActivityData {
+  log_entries: HuntLogEntry[];
+  daily_stats: HuntDailyStat[];
 }

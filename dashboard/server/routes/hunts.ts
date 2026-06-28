@@ -1,5 +1,19 @@
 import { Hono } from 'hono';
 import { getDealDb } from '../db.js';
+import { checkOfferStatusBySource } from '../sources/index.js';
+
+function parseJsonField<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback;
+  try { return JSON.parse(value) as T; } catch { return fallback; }
+}
+
+/**
+ * Default source list for a hunt whose `sources` column is null (legacy rows).
+ * Derived from the hunt's vertical so a cars hunt isn't mislabelled as eBay.
+ */
+function defaultSources(vertical: unknown): string[] {
+  return vertical === 'cars' ? ['autotrader'] : ['ebay'];
+}
 
 export const huntRoutes = new Hono();
 
@@ -7,12 +21,18 @@ export const huntRoutes = new Hono();
 huntRoutes.get('/hunts', (c) => {
   const db = getDealDb();
   const status = c.req.query('status'); // active, paused, closed, or all
+  const vertical = c.req.query('vertical'); // optional filter: computers, cars, etc.
 
-  let whereClause = "WHERE h.status IN ('active', 'paused')";
-  if (status === 'all') whereClause = '';
-  else if (status === 'closed') whereClause = "WHERE h.status = 'closed'";
-  else if (status === 'paused') whereClause = "WHERE h.status = 'paused'";
-  else if (status === 'active') whereClause = "WHERE h.status = 'active'";
+  const conditions: string[] = [];
+  if (status === 'all') { /* no status filter */ }
+  else if (status === 'closed') conditions.push("h.status = 'closed'");
+  else if (status === 'paused') conditions.push("h.status = 'paused'");
+  else if (status === 'active') conditions.push("h.status = 'active'");
+  else conditions.push("h.status IN ('active', 'paused')");
+
+  if (vertical) conditions.push(`h.vertical = '${vertical.replace(/'/g, "''")}'`);
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
   const hunts = db
     .prepare(
@@ -61,12 +81,13 @@ huntRoutes.get('/hunts', (c) => {
 
   const searchMap = new Map(lastSearches.map((s) => [s.hunt_id, s]));
 
-  const enriched = hunts.map((h: Record<string, unknown>) => {
+  const enriched = (hunts as Record<string, unknown>[]).map((h) => {
     const id = h.id as number;
     const prices = priceMap.get(id);
     const search = searchMap.get(id);
     return {
       ...h,
+      sources: parseJsonField(h.sources as string | null, defaultSources(h.vertical)),
       min_price: prices?.min_price ?? null,
       max_price: prices?.max_price ?? null,
       last_searched: search?.last_searched ?? null,
@@ -95,7 +116,8 @@ huntRoutes.get('/hunts/:id', (c) => {
     .get(id);
 
   if (!hunt) return c.json({ error: 'Hunt not found' }, 404);
-  return c.json(hunt);
+  const h = hunt as Record<string, unknown>;
+  return c.json({ ...h, sources: parseJsonField(h.sources as string | null, defaultSources(h.vertical)) });
 });
 
 // Offers for a hunt, filtered by pipeline status
@@ -104,7 +126,7 @@ huntRoutes.get('/hunts/:id/offers', (c) => {
   const status = c.req.query('status') || 'watching';
   const db = getDealDb();
 
-  const offers = db
+  const rows = db
     .prepare(
       `SELECT o.*, ho.status as pipeline_status, ho.first_associated_at,
         (SELECT COALESCE(total_landed_gbp, price) FROM prices WHERE offer_id = o.id ORDER BY observed_at DESC LIMIT 1) as current_price,
@@ -114,7 +136,14 @@ huntRoutes.get('/hunts/:id/offers', (c) => {
       WHERE ho.hunt_id = ? AND ho.status = ?
       ORDER BY o.last_seen_at DESC`,
     )
-    .all(id, status);
+    .all(id, status) as Record<string, unknown>[];
+
+  // Parse the JSON `attributes` column so cars Year/Mileage columns render
+  // (frontend treats attributes as an object, not a raw JSON string).
+  const offers = rows.map((row) => ({
+    ...row,
+    attributes: parseJsonField(row.attributes as string | null, {}),
+  }));
 
   return c.json(offers);
 });
@@ -338,4 +367,93 @@ huntRoutes.get('/hunts/:id/prices', (c) => {
   };
 
   return c.json({ aggregates, observations });
+});
+
+// Activity / history for a hunt
+huntRoutes.get('/hunts/:id/activity', (c) => {
+  const id = parseInt(c.req.param('id'));
+  const period = c.req.query('period') || '30d';
+  const db = getDealDb();
+
+  const periodMap: Record<string, string> = {
+    '7d': '-7 days',
+    '14d': '-14 days',
+    '30d': '-30 days',
+    '90d': '-90 days',
+    all: '-100 years',
+  };
+  const dateModifier = periodMap[period] || '-30 days';
+
+  const log_entries = db
+    .prepare(
+      `SELECT * FROM hunt_log
+      WHERE hunt_id = ? AND logged_at >= datetime('now', ?)
+      ORDER BY logged_at DESC`,
+    )
+    .all(id, dateModifier);
+
+  const daily_stats = db
+    .prepare(
+      `SELECT
+        date(logged_at) as date,
+        COUNT(*) as runs,
+        SUM(offers_evaluated) as evaluated,
+        SUM(offers_alerted) as alerted,
+        SUM(offers_skipped) as skipped
+      FROM hunt_log
+      WHERE hunt_id = ? AND logged_at >= datetime('now', ?)
+      GROUP BY date(logged_at)
+      ORDER BY date ASC`,
+    )
+    .all(id, dateModifier);
+
+  return c.json({ log_entries, daily_stats });
+});
+
+// Refresh all watching offers for a hunt — check each against their source
+huntRoutes.post('/hunts/:id/refresh-watching', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  const db = getDealDb();
+
+  const offers = db
+    .prepare(
+      `SELECT o.id, o.source, o.source_id
+       FROM offers o
+       JOIN hunt_offers ho ON ho.offer_id = o.id
+       WHERE ho.hunt_id = ? AND ho.status = 'watching' AND o.status = 'active'`,
+    )
+    .all(id) as { id: number; source: string; source_id: string }[];
+
+  let checked = 0;
+  let removed = 0;
+  let active = 0;
+  let errors = 0;
+
+  for (const offer of offers) {
+    if (!offer.source_id) continue;
+
+    let result;
+    try {
+      result = await checkOfferStatusBySource(offer.source, offer.source_id);
+    } catch (err) {
+      errors++;
+      continue;
+    }
+    checked++;
+
+    if (result.error) {
+      errors++;
+      continue;
+    }
+
+    if (result.status === 'removed' || result.status === 'ended' || result.status === 'sold') {
+      db.prepare("UPDATE offers SET status = ?, last_status_change = datetime('now') WHERE id = ?").run(result.status, offer.id);
+      removed++;
+    } else {
+      db.prepare("UPDATE offers SET last_seen_at = datetime('now') WHERE id = ?").run(offer.id);
+      active++;
+    }
+  }
+
+  return c.json({ checked, removed, active, errors });
 });

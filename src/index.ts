@@ -321,7 +321,10 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = { session_id: output.newSessionId, last_used: new Date().toISOString() };
+          sessions[group.folder] = {
+            session_id: output.newSessionId,
+            last_used: new Date().toISOString(),
+          };
           setSession(group.folder, output.newSessionId);
         }
         await onOutput(output);
@@ -345,7 +348,10 @@ async function runAgent(
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = { session_id: output.newSessionId, last_used: new Date().toISOString() };
+      sessions[group.folder] = {
+        session_id: output.newSessionId,
+        last_used: new Date().toISOString(),
+      };
       setSession(group.folder, output.newSessionId);
     }
 

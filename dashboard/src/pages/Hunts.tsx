@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { apiGet, apiPost } from '@/lib/api';
 import { queryKeys } from '@/lib/query-keys';
 import { formatPrice, formatRelativeTime } from '@/lib/format';
@@ -24,15 +24,20 @@ const filterTabs: { value: FilterStatus; label: string }[] = [
 
 export default function Hunts() {
   const [filter, setFilter] = useState<FilterStatus>('active');
+  const [searchParams] = useSearchParams();
+  const vertical = searchParams.get('vertical') ?? undefined;
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
   const { data: hunts, isLoading } = useQuery({
-    queryKey: [...queryKeys.hunts.all, filter],
-    queryFn: () =>
-      apiGet<HuntSummary[]>(
-        `/hunts${filter !== 'active' ? `?status=${filter}` : ''}`,
-      ),
+    queryKey: [...queryKeys.hunts.all(vertical), filter],
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (filter !== 'active') params.set('status', filter);
+      if (vertical) params.set('vertical', vertical);
+      const qs = params.toString();
+      return apiGet<HuntSummary[]>(`/hunts${qs ? `?${qs}` : ''}`);
+    },
   });
 
   const handlePauseResume = async (
@@ -44,7 +49,7 @@ export default function Hunts() {
     try {
       await apiPost(`/hunts/${hunt.id}/${action}`);
       toast.success(`Hunt ${action === 'pause' ? 'paused' : 'resumed'}`);
-      queryClient.invalidateQueries({ queryKey: queryKeys.hunts.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.hunts.all() });
     } catch (err) {
       toast.error(`Failed to ${action} hunt`);
     }

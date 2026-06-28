@@ -1,0 +1,1 @@
+timestamp,sessionId,requestId,toolName,toolUseId,inputBytes,inputHash,outputInlineBytes,outputFileBytes,outputFilePath,outputIsError,usage_input_tokens,usage_output_tokens,usage_cache_read_input_tokens,usage_cache_creation_input_tokens

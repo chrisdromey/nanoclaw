@@ -21,6 +21,7 @@ description: >
 - `references/homelab-inventory.md` — user's current hardware, networking, available spares
 - `references/preferences.md` — learned buying preferences (prose, not structured data)
 - `references/product-knowledge/{product}.md` — factual product guides
+- `references/product-knowledge/cars/{make}-{model}.md` — (cars vertical) reusable trim & feature knowledge base, built/maintained by `/car-spec-research`. Key sections by generation; if a long-lived model's file grows beyond ~500 lines, split per generation into a `references/product-knowledge/cars/{make}-{model}/` folder.
 - `references/hunts/{hunt-name}.md` — per-hunt working log
 
 ## Workflow

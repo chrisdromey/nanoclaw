@@ -2,7 +2,7 @@ export const queryKeys = {
   overview: ['overview'] as const,
   systemHealth: ['system', 'health'] as const,
   hunts: {
-    all: ['hunts'] as const,
+    all: (vertical?: string) => ['hunts', { vertical }] as const,
     detail: (id: number) => ['hunts', id] as const,
     offers: (id: number, status?: string) =>
       ['hunts', id, 'offers', status] as const,
@@ -15,6 +15,8 @@ export const queryKeys = {
     segmentPrices: (id: number, segmentId: number) =>
       ['hunts', id, 'segments', segmentId, 'prices'] as const,
     baseline: (id: number) => ['hunts', id, 'baseline'] as const,
+    activity: (id: number, period?: string) =>
+      ['hunts', id, 'activity', period] as const,
   },
   offers: {
     detail: (id: number) => ['offers', id] as const,

@@ -1,0 +1,10 @@
+{
+  "name": "autotrader-http-direct-spike",
+  "private": true,
+  "type": "module",
+  "description": "AutoTrader HTTP-direct access spike — no browser. See FINDINGS.md.",
+  "scripts": {
+    "probe": "node scripts/probe.mjs",
+    "graphql": "node scripts/graphql.mjs"
+  }
+}

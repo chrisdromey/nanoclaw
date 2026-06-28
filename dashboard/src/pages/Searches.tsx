@@ -76,7 +76,7 @@ export default function Searches() {
 
   // Fetch hunts for filter dropdown
   const { data: hunts } = useQuery({
-    queryKey: [...queryKeys.hunts.all, 'all'],
+    queryKey: [...queryKeys.hunts.all(), 'all'],
     queryFn: () => apiGet<Hunt[]>('/hunts?status=all'),
   });
 

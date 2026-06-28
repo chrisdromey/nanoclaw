@@ -1,0 +1,28 @@
+Status: 400
+Elapsed: 66ms
+cf-mitigated: null
+cf-ray: a128961d4dabb111-MAN
+
+access-control-allow-origin: *
+cf-cache-status: DYNAMIC
+cf-ray: a128961d4dabb111-MAN
+connection: keep-alive
+content-security-policy: upgrade-insecure-requests; report-uri https://app.csp-report-receiver.prod.k8.atcloud.io/api/csp/report-uri; report-to autotrader-csp;
+content-type: application/json;charset=utf-8
+date: Sun, 28 Jun 2026 00:31:03 GMT
+etag: W/"4f1-D8xUFN2rQ/0o9jALpk2o8UftZJg"
+referrer-policy: origin-when-cross-origin
+reporting-endpoints: autotrader-csp="https://app.csp-report-receiver.prod.k8.atcloud.io/api/csp/report-to"
+server: cloudflare
+set-cookie: bucket=desktop; Domain=.autotrader.co.uk; path=/;
+set-cookie: abTestGroups=; Path=/; Expires=Sat, 27 Jun 2026 00:31:03 GMT
+set-cookie: __cf_bm=wSnWZX.LmZU0ZEoz.dXqM1XgvR57dOj9k0ZZz6iDbkg-1782606663.2506537-1.0.1.1-Ys8eKsJWNfoT15nBiRQYDdGiOe4EXN.ed9y0k_M3t4c7Xdo0wAQ_lkMtS3TR24XL24t1nIoGYgqmdiA8MUrLNVRSNmGky1o7TCWhh2JMM3b4MFQK1O8mZOG2GsTj7DXg; HttpOnly; SameSite=None; Secure; Path=/; Domain=www.autotrader.co.uk; Expires=Sun, 28 Jun 2026 01:01:03 GMT
+strict-transport-security: max-age=31536000
+transfer-encoding: chunked
+vary: accept-encoding, Accept-Encoding
+x-at-service: sauron-gql-gateway
+x-atcloud-response-service: consumer-gateway
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-request-id: a128961d4dabb111
+x-xss-protection: 1; mode=block

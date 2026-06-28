@@ -1,5 +1,22 @@
 import { Hono } from 'hono';
 import { getDealDb } from '../db.js';
+import { checkOfferStatusBySource, pendingRefreshJobs } from '../sources/index.js';
+import { randomUUID } from 'crypto';
+
+/**
+ * Per-offer deduplication of active async refresh jobs.
+ * Maps offerId → { refreshId, promise } so that a double-click (or concurrent
+ * requests from the hunt's "Refresh Watching" bulk action) for the same offer
+ * returns the existing job rather than firing a duplicate AT request.
+ *
+ * Entry is removed when the job settles.
+ */
+const activeRefreshByOffer = new Map<number, { refreshId: string; promise: Promise<{ status: string; error?: string }> }>();
+
+function parseJsonField<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback;
+  try { return JSON.parse(value) as T; } catch { return fallback; }
+}
 
 export const offerRoutes = new Hono();
 
@@ -7,7 +24,7 @@ export const offerRoutes = new Hono();
 offerRoutes.get('/watched', (c) => {
   const db = getDealDb();
 
-  const offers = db
+  const rows = db
     .prepare(
       `SELECT o.*, ho.hunt_id, h.name as hunt_name, ho.status as pipeline_status,
         (SELECT COALESCE(total_landed_gbp, price) FROM prices WHERE offer_id = o.id ORDER BY observed_at DESC LIMIT 1) as current_price,
@@ -21,7 +38,15 @@ offerRoutes.get('/watched', (c) => {
         CASE WHEN o.auction_end_time IS NOT NULL AND o.auction_end_time > datetime('now') THEN 0 ELSE 1 END,
         o.auction_end_time ASC NULLS LAST`,
     )
-    .all();
+    .all() as Record<string, unknown>[];
+
+  // Parse the JSON `attributes` column so the frontend receives an object
+  // (cars Year/Mileage columns) rather than a raw JSON string. Matches the
+  // single-offer endpoint below.
+  const offers = rows.map((row) => ({
+    ...row,
+    attributes: parseJsonField(row.attributes as string | null, {}),
+  }));
 
   return c.json(offers);
 });
@@ -63,8 +88,10 @@ offerRoutes.get('/offers/:id', (c) => {
     )
     .all(id);
 
+  const offerRow = offer as Record<string, unknown>;
   return c.json({
-    ...(offer as Record<string, unknown>),
+    ...offerRow,
+    attributes: parseJsonField(offerRow.attributes as string | null, {}),
     hunt_associations: huntAssociations,
     evaluations,
     alerts,
@@ -151,4 +178,95 @@ offerRoutes.post('/offers/:id/dismiss', async (c) => {
   }
 
   return c.json({ success: true });
+});
+
+// Refresh a single offer's status from its source
+offerRoutes.post('/offers/:id/refresh', async (c) => {
+  const id = parseInt(c.req.param('id'));
+  const db = getDealDb();
+
+  const offer = db.prepare('SELECT id, source, source_id, status FROM offers WHERE id = ?').get(id) as
+    | { id: number; source: string; source_id: string; status: string }
+    | undefined;
+  if (!offer) return c.json({ error: 'Offer not found' }, 404);
+  if (!offer.source_id) return c.json({ error: 'No source ID available' }, 400);
+
+  // AutoTrader fetches are slow (~1.5s) — kick off async, return 202 + refresh_id.
+  // Deduplicate: if a refresh is already in-flight for this offer, return the
+  // existing refresh_id rather than firing a duplicate AT request (Issue 8).
+  if (offer.source === 'autotrader') {
+    const existing = activeRefreshByOffer.get(id);
+    if (existing) {
+      return c.json({ status: 'pending', refresh_id: existing.refreshId }, 202);
+    }
+
+    const refreshId = randomUUID();
+    const job = checkOfferStatusBySource(offer.source, offer.source_id).then((result) => {
+      if (!result.error && (result.status === 'removed' || result.status === 'ended' || result.status === 'sold')) {
+        db.prepare("UPDATE offers SET status = ?, last_status_change = datetime('now') WHERE id = ?").run(result.status, id);
+      } else if (!result.error) {
+        db.prepare("UPDATE offers SET last_seen_at = datetime('now') WHERE id = ?").run(id);
+      }
+      pendingRefreshJobs.delete(refreshId);
+      activeRefreshByOffer.delete(id);
+      return result;
+    }).catch((err: unknown) => {
+      pendingRefreshJobs.delete(refreshId);
+      activeRefreshByOffer.delete(id);
+      const msg = err instanceof Error ? err.message : String(err);
+      return { status: 'active' as const, error: msg };
+    });
+
+    pendingRefreshJobs.set(refreshId, job);
+    activeRefreshByOffer.set(id, { refreshId, promise: job });
+    return c.json({ status: 'pending', refresh_id: refreshId }, 202);
+  }
+
+  // eBay and other fast sources: synchronous path
+  let result;
+  try {
+    result = await checkOfferStatusBySource(offer.source, offer.source_id);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: msg }, 502);
+  }
+
+  if (result.error) {
+    return c.json({ error: result.error }, 502);
+  }
+
+  if (result.status === 'removed' || result.status === 'ended' || result.status === 'sold') {
+    db.prepare("UPDATE offers SET status = ?, last_status_change = datetime('now') WHERE id = ?").run(result.status, id);
+    return c.json({ status: result.status });
+  }
+
+  // Still live — bump last_seen_at
+  db.prepare("UPDATE offers SET last_seen_at = datetime('now') WHERE id = ?").run(id);
+  return c.json({ status: 'active', refreshed: true });
+});
+
+// Poll the result of an async refresh job (for AutoTrader and other slow sources)
+offerRoutes.get('/offers/:id/refresh/:refreshId', async (c) => {
+  const refreshId = c.req.param('refreshId');
+  const job = pendingRefreshJobs.get(refreshId);
+
+  if (!job) {
+    // Job not found — either it completed and was cleaned up, or it never existed.
+    // The client should re-fetch offer detail to get the updated status.
+    return c.json({ status: 'completed' });
+  }
+
+  // Check if the promise is settled (non-blocking peek)
+  let resolved = false;
+  let result: { status: string; error?: string } | undefined;
+  await Promise.race([
+    job.then((r) => { resolved = true; result = r; }),
+    Promise.resolve(),
+  ]);
+
+  if (resolved && result) {
+    return c.json({ status: result.status, error: result.error });
+  }
+
+  return c.json({ status: 'pending' });
 });

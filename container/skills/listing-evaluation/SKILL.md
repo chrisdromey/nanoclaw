@@ -1,13 +1,27 @@
 ---
 name: listing-evaluation
 description: >
-  Evaluate one or more offers against hunt criteria and market baselines.
+  Evaluates computer-hardware listings (eBay sold-comp methodology, condition grading,
+  auction-end-time urgency). The evaluator for the `computers` vertical.
   Use when the watcher finds new offers, when the user shares a listing
   link, when reassessing a watched offer after a price or status change,
   or when asked whether a specific deal is good value.
 ---
 
 # /listing-evaluation — Evaluate Offers
+
+## Delegation
+
+When this skill is triggered from an interactive chat session (user message, not a scheduled task), delegate to the `deal-evaluator` sub-agent instead of doing the work inline. This keeps the chat context lean.
+
+1. Gather context: hunt ID, what to evaluate (new offers / specific listing / broad check)
+2. Delegate to `deal-evaluator` with that context
+3. Relay the returned summary to the user
+
+Do NOT delegate when:
+- You ARE the `deal-evaluator` sub-agent (this skill was preloaded via `skills`)
+- This is a scheduled/watcher invocation (`[SCHEDULED TASK]` or `[WATCHER]` prefix in prompt)
+- Trivial lookup (single field check, no search needed)
 
 ## When to use
 
@@ -19,8 +33,8 @@ description: >
 
 ## Orientation
 
-1. `mcp__deal-hunter-db__get_hunt` — get the hunt criteria
-2. Read the hunt file (`references/hunts/{hunt}.md`) — price research, strategy notes, value tiers
+1. `mcp__deal-hunter-db__get_hunt_summary` — get hunt criteria, market segments (with price tiers and tags), watched offers, and health warnings. The `market_segments` field is your authoritative source for price tiers — use price_low/mid/high to assess value.
+2. Read the hunt file (`references/hunts/{hunt}.md`) — market context, strategy notes, qualitative observations (not price tiers — those come from segments above)
 3. Read `references/preferences.md` — general buying preferences
 4. Check past evaluations and user feedback for similar items
 5. Read `references/research/{hunt-name}/` if it exists — deep dive research files may have spec details or compatibility notes relevant to evaluation
@@ -35,9 +49,15 @@ For full item details (specs, description, seller history), call `mcp__ebay-api_
 
 ## Workflow
 
-For each offer:
+### Triage first
 
-1. **Check if previously evaluated** — `mcp__deal-hunter-db__get_offer` with history. If nothing changed, skip.
+Work like a person scanning search results — you don't click every listing. Use `mcp__deal-hunter-db__list_offers` to fetch slim triage rows (title, price, condition, status) and read through them. You can often tell from the title alone whether something is worth a closer look. Use `batch_dismiss` to clear the obvious mismatches in one call, then use `get_offer` to dive deeper on what's left.
+
+### Then evaluate
+
+For each remaining offer:
+
+1. **Check if previously evaluated** — `mcp__deal-hunter-db__get_offer` for full details + last evaluation. Use `get_offer_history` if you need price trends. If nothing changed, skip.
 2. **Calculate true landed cost** — item + shipping. Non-UK sellers: add duty + 20% VAT.
 3. **Evaluate against criteria and baseline** — does it meet requirements? How does the price compare to what you know from the hunt file's price research?
 4. **Assess urgency** — auction ending soon is urgent, stable BIN is not.
@@ -67,8 +87,11 @@ Every listing you evaluate is market intelligence. As you evaluate, notice:
 - Specs or features you didn't expect — might warrant research or criteria adjustment
 - Whole categories or brands you're seeing that weren't on the radar
 - Products the user keeps rejecting — understand why and tighten criteria to filter them out
+- Cheaper or simpler products that meet the actual need — the hunt criteria may be over-specced. If you keep skipping products that would solve the user's problem at lower cost because they don't match a stated spec, question whether that spec is justified.
 
 When patterns emerge, act on them: add search terms, adjust criteria, update the hunt file's strategy notes, trigger /research for unfamiliar products. Don't just evaluate listings in isolation — use them to make the hunt smarter over time.
+
+Run-level logging (what you evaluated, counts, observations about this batch) goes to `log_hunt_run`, not the hunt file. The hunt file is for durable reference material (strategy notes, notable findings) that you update in-place.
 
 ## Rules
 

@@ -1,0 +1,41 @@
+[
+  {
+    "advertId": "202605062159983",
+    "detailHref": "/car-details/202605062159983",
+    "makeModel": "Audi A4",
+    "title": "Audi A4 2.0 TFSI Black Edition Euro 5 (s/s) 4dr",
+    "year": "2011",
+    "mileage": "172,250",
+    "price": "£1,995",
+    "attentionGrabber": "Timing been done 2025/came px",
+    "image": "https://m.atcdn.co.uk/a/media/w480/8e0ff2d05c6b49f09c71882fb40dd399.jpg",
+    "reserveOnline": true,
+    "descriptionPreview": "This 2011 Audi A4 TFSI Black Edition boasts an MOT valid until August 2026, offering peace of mind for the coming years."
+  },
+  {
+    "advertId": "202606173366517",
+    "detailHref": "/car-details/202606173366517",
+    "makeModel": "Audi A4",
+    "title": "Audi A4 2.0 TDI SE Technik Multitronic Euro 5 (s/s) 4dr",
+    "year": "2016",
+    "mileage": "123,000",
+    "price": "£4,999",
+    "attentionGrabber": "•TECHNIK •SE •AUTO •BLACK PACK",
+    "image": "https://m.atcdn.co.uk/a/media/w480/c6ba719696e9487c925f6bd2bcaf1852.jpg",
+    "reserveOnline": true,
+    "descriptionPreview": "This 2016 Audi A4 TDI SE Technik offers a superb blend of efficiency and advanced technology.  Powered by a 2.0 litre di"
+  },
+  {
+    "advertId": "202606083099347",
+    "detailHref": "/car-details/202606083099347",
+    "makeModel": "Audi A4",
+    "title": "Audi A4 2.0 TDI Black Edition quattro Euro 5 (s/s) 4dr",
+    "year": "2014",
+    "mileage": "130,441",
+    "price": "£5,400",
+    "attentionGrabber": "NEW CAMBELT+2KEYS+SH+NAV+P SEN",
+    "image": "https://m.atcdn.co.uk/a/media/w480/b45988d3a9914e07aac3a55562ae67aa.jpg",
+    "reserveOnline": true,
+    "descriptionPreview": "FRESH SERVICE WITH NEW CAMBELT+SERVICE HISTORY + RECENTLY SERVICED (OIL &amp; FILTER)+MOTF MOT+NAVIGATION+PARKING SENSOR"
+  }
+]

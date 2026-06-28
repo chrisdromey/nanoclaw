@@ -90,7 +90,7 @@ baselineRoutes.get('/hunts/:id/baseline', (c) => {
   // Current active watched offer prices for overlay comparison
   const activeOfferPrices = db
     .prepare(
-      `SELECT o.id as offer_id, o.title, o.condition,
+      `SELECT o.id as offer_id, o.title, o.condition, o.buying_format,
         (SELECT COALESCE(p.total_landed_gbp, p.price)
          FROM prices p WHERE p.offer_id = o.id
          ORDER BY p.observed_at DESC LIMIT 1) as current_price

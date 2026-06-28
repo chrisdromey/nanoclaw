@@ -37,10 +37,9 @@ app.get('/api/health', (c) => c.json({ ok: true }));
 
 // In production, serve the built SPA
 if (process.env.NODE_ENV === 'production') {
-  const staticRoot = path.resolve(__dirname, '../dist/client');
-  app.use('/*', serveStatic({ root: staticRoot }));
+  app.use('/*', serveStatic({ root: 'dist/client' }));
   // SPA fallback
-  app.get('*', serveStatic({ root: staticRoot, path: '/index.html' }));
+  app.get('*', serveStatic({ root: 'dist/client', path: '/index.html' }));
 }
 
 const server = serve({ fetch: app.fetch, port: PORT }, (info) => {

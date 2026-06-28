@@ -44,5 +44,7 @@ export const SCHEDULER_TICK_MS = 30_000;         // Check hunts every 30s
 export const TOKEN_REFRESH_MS = 5_400_000;        // Refresh OAuth token every 90min
 export const WATCH_CADENCE_MS = 2 * 60 * 60_000;  // Check watched offers every 2h
 export const AUCTION_THRESHOLDS = [24, 12, 6];    // Graduated auction countdown thresholds (hours, descending)
+export const STALENESS_SWEEP_CADENCE_MS = 4 * 60 * 60_000; // Sweep stale offers every 4h
+export const STALE_OFFER_HOURS = 24;              // Offers unseen for 24h are considered stale
 export const DAILY_API_BUDGET = 4500;             // Stop at 4500 (limit is 5000/day)
 export const SEARCH_LIMIT_PER_FORMAT = 50;

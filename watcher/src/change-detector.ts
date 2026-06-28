@@ -6,7 +6,7 @@
 import type Database from 'better-sqlite3';
 import { AUCTION_THRESHOLDS } from './config.js';
 import { getLatestPrice, type Offer } from './db.js';
-import type { ItemDetail } from './ebay/types.js';
+import type { ItemDetail } from './sources/ebay/types.js';
 
 export type ChangeType =
   | 'offer_ended'
@@ -19,6 +19,7 @@ export type ChangeType =
 export interface Change {
   type: ChangeType;
   offerId: number;
+  source: string;
   sourceId: string;
   title: string;
   urgent: boolean;
@@ -39,6 +40,7 @@ export function detectWatchChanges(
     changes.push({
       type: 'offer_ended',
       offerId: offer.id,
+      source: offer.source,
       sourceId: offer.source_id,
       title: offer.title,
       urgent: true,
@@ -62,6 +64,7 @@ export function detectWatchChanges(
       changes.push({
         type,
         offerId: offer.id,
+        source: offer.source,
         sourceId: offer.source_id,
         title: offer.title,
         urgent: false, // may be upgraded by watch condition check below
@@ -79,6 +82,7 @@ export function detectWatchChanges(
     changes.push({
       type: 'bid_count_change',
       offerId: offer.id,
+      source: offer.source,
       sourceId: offer.source_id,
       title: offer.title,
       urgent: false,
@@ -97,6 +101,7 @@ export function detectWatchChanges(
           changes.push({
             type: 'auction_ending',
             offerId: offer.id,
+            source: offer.source,
             sourceId: offer.source_id,
             title: offer.title,
             urgent: threshold <= 6,
@@ -126,6 +131,7 @@ export function detectWatchChanges(
           changes.push({
             type: 'watch_condition_met',
             offerId: offer.id,
+            source: offer.source,
             sourceId: offer.source_id,
             title: offer.title,
             urgent: true,
@@ -141,6 +147,7 @@ export function detectWatchChanges(
           changes.push({
             type: 'watch_condition_met',
             offerId: offer.id,
+            source: offer.source,
             sourceId: offer.source_id,
             title: offer.title,
             urgent: true,

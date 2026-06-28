@@ -531,7 +531,9 @@ export interface SessionEntry {
 
 export function getSession(groupFolder: string): SessionEntry | undefined {
   return db
-    .prepare('SELECT session_id, last_used FROM sessions WHERE group_folder = ?')
+    .prepare(
+      'SELECT session_id, last_used FROM sessions WHERE group_folder = ?',
+    )
     .get(groupFolder) as SessionEntry | undefined;
 }
 
@@ -549,15 +551,25 @@ export function deleteSession(groupFolder: string): void {
 export function getAllSessions(): Record<string, SessionEntry> {
   const rows = db
     .prepare('SELECT group_folder, session_id, last_used FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string; last_used: string | null }>;
+    .all() as Array<{
+    group_folder: string;
+    session_id: string;
+    last_used: string | null;
+  }>;
   const result: Record<string, SessionEntry> = {};
   for (const row of rows) {
-    result[row.group_folder] = { session_id: row.session_id, last_used: row.last_used };
+    result[row.group_folder] = {
+      session_id: row.session_id,
+      last_used: row.last_used,
+    };
   }
   return result;
 }
 
-export function isSessionExpired(lastUsed: string | null, ttlMs: number): boolean {
+export function isSessionExpired(
+  lastUsed: string | null,
+  ttlMs: number,
+): boolean {
   if (!lastUsed) return true;
   return Date.now() - new Date(lastUsed).getTime() > ttlMs;
 }

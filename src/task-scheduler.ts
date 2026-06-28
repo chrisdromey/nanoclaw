@@ -2,7 +2,13 @@ import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, SESSION_TTL_MS, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  SCHEDULER_POLL_INTERVAL,
+  SESSION_TTL_MS,
+  STALE_TASK_GRACE_MS,
+  TIMEZONE,
+} from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -62,6 +68,32 @@ export function computeNextRun(task: ScheduledTask): string | null {
   }
 
   return null;
+}
+
+/**
+ * Skip a task whose scheduled time was missed by more than the grace window
+ * (typically because the host was powered off). Recording it via
+ * updateTaskAfterRun marks `once` tasks completed (computeNextRun → null) and
+ * rolls `cron`/`interval` tasks forward to their next future occurrence, so a
+ * long downtime never replays a flood of obsolete runs on restart.
+ */
+function skipStaleTask(task: ScheduledTask, overdueMs: number): void {
+  const overdueHours = (overdueMs / 3_600_000).toFixed(1);
+  const nextRun = computeNextRun(task);
+  updateTaskAfterRun(
+    task.id,
+    nextRun,
+    `Skipped: ${overdueHours}h overdue (missed during downtime)`,
+  );
+  logger.warn(
+    {
+      taskId: task.id,
+      scheduleType: task.schedule_type,
+      overdueHours,
+      nextRun,
+    },
+    'Skipping stale task missed during downtime',
+  );
 }
 
 export interface SchedulerDependencies {
@@ -266,6 +298,15 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
+          continue;
+        }
+
+        // Skip tasks missed during downtime instead of replaying them.
+        const overdueMs = currentTask.next_run
+          ? Date.now() - new Date(currentTask.next_run).getTime()
+          : 0;
+        if (overdueMs > STALE_TASK_GRACE_MS) {
+          skipStaleTask(currentTask, overdueMs);
           continue;
         }
 

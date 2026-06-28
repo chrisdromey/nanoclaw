@@ -1,0 +1,74 @@
+_default:
+  evaluator_skill: generic-deal-evaluator
+  sourcing_skill: ebay-sourcing                       # the HOW: market recon + price baselining
+  recon_tool: mcp__ebay-search__search_ebay           # market-recon entrypoint used during discovery
+  knowledge_base_path: references/product-knowledge/{product}.md
+  sources: []
+  default_poll_minutes: 60
+  criteria_schema: {}
+
+computers:
+  inherit: _default
+  evaluator_skill: listing-evaluation
+  sourcing_skill: ebay-sourcing
+  recon_tool: mcp__ebay-search__search_ebay
+  knowledge_base_path: references/product-knowledge/{product}.md
+  sources: [ebay]
+  default_poll_minutes: 5
+  # Evaluator sub-agent for this vertical (built into the container agent loop from this block).
+  # name is stable so skill delegation references don't break; skills = [evaluator_skill].
+  agent:
+    name: deal-evaluator
+    description: 'Evaluates listings for the computers vertical (eBay-sourced). Delegate to this agent when the user asks to evaluate offers, check a listing, or assess deal value for computer hardware. Returns a concise evaluation summary to relay to the user.'
+    prompt: |-
+      You are a deal evaluation specialist. Follow the listing-evaluation skill instructions precisely.
+
+      Key rules:
+      - Do NOT message the user directly — you have no access to the nanoclaw MCP
+      - Return a concise summary (under 500 words) of your evaluation findings
+      - Include: what you evaluated, decisions (ALERT/WATCH/SKIP with reasons), and any market observations
+      - Record all evaluations to the database before returning
+      - If you encounter products you cannot evaluate, note the gap
+
+cars:
+  inherit: _default
+  evaluator_skill: car-listing-evaluation
+  sourcing_skill: cars-sourcing
+  recon_tool: mcp__autotrader-search__autotrader_search
+  knowledge_base_path: references/product-knowledge/cars/{make}-{model}.md
+  sources: [autotrader]
+  default_poll_minutes: 360  # 6h — cars don't move quickly
+  criteria_schema:
+    make: string
+    model: string
+    year_min: integer?
+    year_max: integer?
+    max_price: integer?
+    max_mileage: integer?
+    postcode: string
+    fuel: string?
+    transmission: string?
+  notification_formatter: cars
+  attributes_required:
+    - year
+    - mileage_num
+    - fuel
+    - transmission
+    - body_type
+    - seller_type
+    - location_text
+    - distance_miles
+    - price_tier
+  agent:
+    name: cars-evaluator
+    description: 'Evaluates car listings (cars vertical). Use for hunts where vertical=cars. Returns a concise evaluation summary including price-tier signal, mileage/spec assessment, and comp comparison.'
+    prompt: |-
+      You are a car deal evaluation specialist. Follow the car-listing-evaluation skill instructions precisely.
+
+      Key rules:
+      - Do NOT message the user directly — you have no access to the nanoclaw MCP
+      - Return a concise summary (under 500 words) of your evaluation findings
+      - Include: what you evaluated, decisions (ALERT/WATCH/SKIP with reasons), price-tier signals used, and any notable patterns
+      - Record all evaluations to the database before returning
+      - For alerts, compose the cars notification format string yourself and pass it as record_alert's message_sent (there is no downstream formatter on the agent path)
+

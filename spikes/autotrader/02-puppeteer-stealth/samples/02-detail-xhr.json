@@ -1,0 +1,12 @@
+[
+  {
+    "url": "https://cmpv2.autotrader.co.uk/consent/tcfv2/vendor-list/latest-version?siteId=2512&accountId=741&hasCsp=true",
+    "status": 200,
+    "ct": "application/json; charset=utf-8"
+  },
+  {
+    "url": "https://cmpv2.autotrader.co.uk/consent/tcfv2/consent/v2/data-pipeline/pv-data?hasCsp=true&cacheHash=500185785487832972c77c",
+    "status": 200,
+    "ct": "application/json; charset=utf-8"
+  }
+]

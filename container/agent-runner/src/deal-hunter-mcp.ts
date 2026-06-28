@@ -45,12 +45,111 @@ function errorResult(message: string) {
   return { content: [{ type: 'text' as const, text: JSON.stringify({ error: message }) }], isError: true };
 }
 
+// Vertical capabilities are mirrored from config/verticals.yml into the `verticals` table
+// by the watcher at startup (verticals.yml is not mounted in-container). These helpers read
+// that table so the agent resolves vertical config at runtime instead of hardcoding it.
+const hasVerticalsTable = tables.includes('verticals');
+
+function getVerticalConfig(name: string): Record<string, unknown> | null {
+  if (!hasVerticalsTable) return null;
+  const row = db.prepare('SELECT config_json FROM verticals WHERE name = ?').get(name) as
+    | { config_json: string }
+    | undefined;
+  if (!row) return null;
+  try {
+    return JSON.parse(row.config_json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function listVerticalConfigs(): Array<Record<string, unknown>> {
+  if (!hasVerticalsTable) return [];
+  const rows = db.prepare('SELECT config_json FROM verticals ORDER BY name').all() as Array<{
+    config_json: string;
+  }>;
+  const out: Array<Record<string, unknown>> = [];
+  for (const r of rows) {
+    try {
+      out.push(JSON.parse(r.config_json) as Record<string, unknown>);
+    } catch {
+      // skip malformed rows
+    }
+  }
+  return out;
+}
+
+// Default source list per vertical, resolved from the verticals table. Falls back to ['ebay']
+// when the vertical is unknown or the table hasn't been populated yet.
+function defaultSourcesForVertical(vertical: string): string[] {
+  const cfg = getVerticalConfig(vertical);
+  const sources = cfg?.sources;
+  if (Array.isArray(sources) && sources.length > 0) return sources.map(String);
+  return ['ebay'];
+}
+
+function parseSourcesJson(raw?: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Whether a hunt searches eBay — used to gate eBay-only guidance (e.g. category_ids).
+function huntUsesEbay(hunt: { vertical?: string | null; sources?: string | null }): boolean {
+  const sources = parseSourcesJson(hunt.sources);
+  if (sources.length > 0) return sources.includes('ebay');
+  // No sources recorded (legacy hunt) — fall back to the vertical (default 'computers' = eBay).
+  return (hunt.vertical ?? 'computers') === 'computers';
+}
+
 // --- MCP Server ---
 
 const server = new McpServer({
   name: 'deal-hunter-db',
   version: '1.0.0',
 });
+
+// ============================================================
+// Tool: list_verticals — discover available verticals + their capabilities
+// ============================================================
+server.tool(
+  'list_verticals',
+  "List the available hunt verticals (categories of thing being hunted, e.g. 'computers', 'cars') and the capabilities of each: which data sources it searches, the criteria fields it accepts, and the names of the skills that handle its market research and its listing evaluation. Call this to find out which verticals exist before creating or working a hunt.",
+  {},
+  async () => {
+    const verticals = listVerticalConfigs();
+    if (verticals.length === 0) {
+      return jsonResult({
+        verticals: [],
+        note: 'No verticals recorded yet — the watcher populates this table at startup from config/verticals.yml.',
+      });
+    }
+    return jsonResult({ verticals });
+  },
+);
+
+// ============================================================
+// Tool: get_vertical — resolve one vertical's capabilities
+// ============================================================
+server.tool(
+  'get_vertical',
+  "Look up one vertical's configuration by name. Returns: `sources` (the data sources to search for this vertical), `criteria_schema` (the criteria fields a hunt in this vertical accepts), `recon_tool` (the search tool to use for market reconnaissance), `knowledge_base_path` (file-path pattern for this vertical's reference knowledge), `sourcing_skill` (the skill describing how to research market prices for it), and `evaluator_skill` (the skill describing how to evaluate its listings). Call this when working a hunt to find the correct source, criteria, and skills for that hunt's vertical.",
+  { name: z.string().describe("Vertical name, e.g. 'computers' or 'cars'") },
+  async ({ name }) => {
+    const cfg = getVerticalConfig(name);
+    if (!cfg) {
+      const known = listVerticalConfigs().map((v) => v.name);
+      return errorResult(
+        `Unknown vertical '${name}'. Known: ${known.length ? known.join(', ') : '(none recorded — is the watcher running?)'}`,
+      );
+    }
+    return jsonResult(cfg);
+  },
+);
 
 // ============================================================
 // Tool 1: manage_hunt
@@ -66,15 +165,22 @@ server.tool(
     search_terms: z.string().optional().describe('JSON string of search terms. Simple format: ["term1", "term2"]. Per-term categories: [{"terms": "term1", "category_ids": "1244"}, {"terms": "term2"}]. Per-term category_ids override hunt-level category_ids.'),
     cadence_minutes: z.number().optional(),
     monitoring: z.boolean().optional().describe('Enable/disable watcher monitoring for this hunt (default true). Set false during research/baselining.'),
-    category_ids: z.string().optional().describe('Comma-separated eBay category IDs to filter watcher searches (e.g. "179" for PC Desktops). Acts as the default for all search terms. Individual terms can override via per-term category_ids in search_terms.'),
+    category_ids: z.string().optional().describe('Comma-separated eBay category IDs to filter watcher searches (e.g. "179" for PC Desktops). Acts as the default for all search terms. Individual terms can override via per-term category_ids in search_terms. eBay-only.'),
+    vertical: z.string().optional().describe("Vertical for this hunt, e.g. 'computers' (eBay) or 'cars' (AutoTrader). Defaults to 'computers' on create. Determines which evaluator/source the watcher uses."),
+    sources: z.array(z.string()).optional().describe("Source adapters to poll, e.g. ['ebay'] or ['autotrader']. Defaults from the vertical when omitted on create."),
+    poll_interval_minutes: z.number().optional().describe('Override the watcher poll interval (minutes). Omit to let the watcher derive cadence from the vertical policy.'),
     close_reason: z.string().optional().describe('Reason for closing (bought, changed_mind, etc.)'),
   },
-  async ({ action, hunt_id, name, criteria, search_terms, cadence_minutes, monitoring, category_ids, close_reason }) => {
+  async ({ action, hunt_id, name, criteria, search_terms, cadence_minutes, monitoring, category_ids, vertical, sources, poll_interval_minutes, close_reason }) => {
     if (action === 'create') {
       if (!name) return errorResult('name is required for create');
+      const huntVertical = vertical || 'computers';
+      const huntSources = sources && sources.length > 0
+        ? sources
+        : defaultSourcesForVertical(huntVertical);
       const result = db.prepare(`
-        INSERT INTO hunts (name, criteria, search_terms, cadence_minutes, monitoring, category_ids)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO hunts (name, criteria, search_terms, cadence_minutes, monitoring, category_ids, vertical, sources, poll_interval_minutes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         name,
         criteria || '{}',
@@ -82,6 +188,9 @@ server.tool(
         cadence_minutes || 60,
         monitoring === false ? 0 : 1,
         category_ids || null,
+        huntVertical,
+        JSON.stringify(huntSources),
+        poll_interval_minutes ?? null,
       );
       const hunt = db.prepare('SELECT * FROM hunts WHERE id = ?').get(result.lastInsertRowid);
       return jsonResult({ action: 'created', hunt });
@@ -100,6 +209,9 @@ server.tool(
       if (cadence_minutes !== undefined) { sets.push('cadence_minutes = ?'); params.push(cadence_minutes); }
       if (monitoring !== undefined) { sets.push('monitoring = ?'); params.push(monitoring ? 1 : 0); }
       if (category_ids !== undefined) { sets.push('category_ids = ?'); params.push(category_ids || null); }
+      if (vertical !== undefined) { sets.push('vertical = ?'); params.push(vertical); }
+      if (sources !== undefined) { sets.push('sources = ?'); params.push(JSON.stringify(sources)); }
+      if (poll_interval_minutes !== undefined) { sets.push('poll_interval_minutes = ?'); params.push(poll_interval_minutes); }
       if (sets.length === 0) return errorResult('Nothing to update');
       params.push(hunt_id);
       db.prepare(`UPDATE hunts SET ${sets.join(', ')} WHERE id = ?`).run(...params);
@@ -242,6 +354,43 @@ server.tool(
       SELECT status, COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? GROUP BY status
     `).all(hunt_id);
 
+    // Health warnings — surface issues the agent should address
+    const healthWarnings: string[] = [];
+
+    const segmentCount = (db.prepare(
+      'SELECT COUNT(*) as count FROM market_segments WHERE hunt_id = ?',
+    ).get(hunt_id) as any).count;
+
+    if (segmentCount === 0) {
+      healthWarnings.push(
+        '⚠️ NO MARKET SEGMENTS — this hunt has no baseline data. The dashboard "vs Base" column is broken and your evaluations are not grounded in market data. Run /price-baselining to create market segments and record baseline prices before evaluating offers.',
+      );
+    } else {
+      const latestBaseline = db.prepare(
+        'SELECT MAX(bp.observed_at) as latest FROM baseline_prices bp JOIN market_segments ms ON ms.id = bp.segment_id WHERE ms.hunt_id = ?',
+      ).get(hunt_id) as any;
+      if (latestBaseline?.latest) {
+        const ageMs = Date.now() - new Date(latestBaseline.latest + 'Z').getTime();
+        const ageDays = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+        if (ageDays > 14) {
+          healthWarnings.push(
+            `⚠️ STALE BASELINE — last baseline data is ${ageDays} days old. Consider refreshing with /price-baselining.`,
+          );
+        }
+      }
+    }
+
+    // category_ids is an eBay-only concept — don't warn for cars/AutoTrader (or other non-eBay) hunts.
+    if (!(hunt as any).category_ids && huntUsesEbay(hunt as any)) {
+      healthWarnings.push(
+        '⚠️ NO CATEGORY FILTER — this hunt has no category_ids set. Watcher searches may return noise (accessories, parts, unrelated items). Set category_ids based on relevant eBay categories.',
+      );
+    }
+
+    const marketSegments = db.prepare(
+      'SELECT id, name, tags, price_low, price_mid, price_high, confidence FROM market_segments WHERE hunt_id = ?',
+    ).all(hunt_id);
+
     return jsonResult({
       hunt,
       new_offer_count: (newOffers as any).count,
@@ -251,6 +400,8 @@ server.tool(
       recent_searches: recentSearches,
       recent_feedback: recentFeedback,
       offer_counts: offerCounts,
+      market_segments: marketSegments,
+      health_warnings: healthWarnings,
     });
   },
 );
@@ -375,7 +526,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 5: record_offer
+// Tool 6: record_offer
 // ============================================================
 server.tool(
   'record_offer',
@@ -389,6 +540,8 @@ server.tool(
     seller_rating: z.number().optional(),
     condition: z.string().optional(),
     specs_extracted: z.string().optional().describe('JSON string'),
+    attributes: z.record(z.string(), z.unknown()).optional().describe('Structured source attributes object (stored as JSON). For cars: subTitle, attentionGrabber, year, distance_miles, price_tier, etc. — these power list_offers triage columns.'),
+    vertical: z.string().optional().describe("Vertical this offer belongs to, e.g. 'computers' or 'cars'. Sets offers.vertical."),
     buying_format: z.string().optional(),
     auction_end_time: z.string().optional(),
     bid_count: z.number().optional(),
@@ -416,6 +569,8 @@ server.tool(
         if (args.seller_rating !== undefined) { sets.push('seller_rating = ?'); params.push(args.seller_rating); }
         if (args.condition !== undefined) { sets.push('condition = ?'); params.push(args.condition); }
         if (args.specs_extracted !== undefined) { sets.push('specs_extracted = ?'); params.push(args.specs_extracted); }
+        if (args.attributes !== undefined) { sets.push('attributes = ?'); params.push(JSON.stringify(args.attributes)); }
+        if (args.vertical !== undefined) { sets.push('vertical = ?'); params.push(args.vertical); }
         if (args.buying_format !== undefined) { sets.push('buying_format = ?'); params.push(args.buying_format); }
         if (args.auction_end_time !== undefined) { sets.push('auction_end_time = ?'); params.push(args.auction_end_time); }
         if (args.bid_count !== undefined) { sets.push('bid_count = ?'); params.push(args.bid_count); }
@@ -425,12 +580,14 @@ server.tool(
       } else {
         const result = db.prepare(`
           INSERT INTO offers (source, source_id, title, url, seller, seller_rating, condition,
-            specs_extracted, buying_format, auction_end_time, bid_count)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            specs_extracted, attributes, vertical, buying_format, auction_end_time, bid_count)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           args.source, args.source_id, args.title, args.url || null,
           args.seller || null, args.seller_rating ?? null, args.condition || null,
-          args.specs_extracted || '{}', args.buying_format || null,
+          args.specs_extracted || '{}',
+          args.attributes !== undefined ? JSON.stringify(args.attributes) : '{}',
+          args.vertical || null, args.buying_format || null,
           args.auction_end_time || null, args.bid_count ?? null,
         );
         offerId = result.lastInsertRowid as number;
@@ -467,7 +624,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 6: update_offer
+// Tool 7: update_offer
 // ============================================================
 server.tool(
   'update_offer',
@@ -479,6 +636,8 @@ server.tool(
     status: z.enum(['active', 'ended', 'removed', 'sold']).optional(),
     watching: z.boolean().optional(),
     watch_conditions: z.string().optional().describe('JSON string'),
+    attributes: z.record(z.string(), z.unknown()).optional().describe('Structured source attributes object (stored as JSON). Powers list_offers triage columns — e.g. for cars: subTitle, attentionGrabber, year, distance_miles, price_tier.'),
+    vertical: z.string().optional().describe("Vertical this offer belongs to, e.g. 'computers' or 'cars'."),
     hunt_id: z.number().optional().describe('If provided with hunt_offer_status, updates the hunt_offer'),
     hunt_offer_status: z.enum(['new', 'evaluated', 'watching', 'dismissed']).optional(),
   },
@@ -499,6 +658,8 @@ server.tool(
       if (!args.watching) { sets.push("notified_thresholds = '[]'"); }
     }
     if (args.watch_conditions !== undefined) { sets.push('watch_conditions = ?'); params.push(args.watch_conditions); }
+    if (args.attributes !== undefined) { sets.push('attributes = ?'); params.push(JSON.stringify(args.attributes)); }
+    if (args.vertical !== undefined) { sets.push('vertical = ?'); params.push(args.vertical); }
 
     if (sets.length > 0) {
       params.push(offerId);
@@ -516,17 +677,14 @@ server.tool(
 );
 
 // ============================================================
-// Tool 7: get_offer
+// Tool 8: get_offer
 // ============================================================
+// --- Tool 8a: list_offers (triage scan — slim rows for batch decisions) ---
+
 server.tool(
-  'get_offer',
-  'Get a single offer by ID or source+source_id (with optional full history), or search offers by attributes.',
+  'list_offers',
+  'List offers with slim triage-weight rows. Use for scanning new offers, reviewing watched items, or any batch view. Returns only the fields needed for quick decisions — use get_offer to dive deeper on specific items.',
   {
-    offer_id: z.number().optional(),
-    source: z.string().optional(),
-    source_id: z.string().optional(),
-    include_history: z.boolean().optional().describe('Include all prices, evaluations, alerts'),
-    // Search mode params
     hunt_id: z.number().optional().describe('Filter by hunt association'),
     hunt_offer_status: z.string().optional().describe('Filter by hunt_offer status (new, evaluated, watching, dismissed)'),
     condition: z.string().optional(),
@@ -534,37 +692,19 @@ server.tool(
     max_price: z.number().optional().describe('Max latest total_landed_gbp'),
     watching_only: z.boolean().optional(),
     limit: z.number().optional().describe('Max results (default 50, max 200)'),
-    offset: z.number().optional().describe('Skip this many results for pagination (default 0)'),
+    page: z.number().min(1).default(1).describe('Page number for pagination'),
   },
   async (args) => {
-    // Single offer mode
-    if (args.offer_id || (args.source && args.source_id)) {
-      let offer: any;
-      if (args.offer_id) {
-        offer = db.prepare('SELECT * FROM offers WHERE id = ?').get(args.offer_id);
-      } else {
-        offer = db.prepare('SELECT * FROM offers WHERE source = ? AND source_id = ?').get(args.source, args.source_id);
-      }
-      if (!offer) return errorResult('Offer not found');
-
-      if (args.include_history) {
-        const prices = db.prepare('SELECT * FROM prices WHERE offer_id = ? ORDER BY observed_at DESC').all(offer.id);
-        const evaluations = db.prepare('SELECT * FROM evaluations WHERE offer_id = ? ORDER BY evaluated_at DESC').all(offer.id);
-        const alerts = db.prepare('SELECT * FROM alerts WHERE offer_id = ? ORDER BY alerted_at DESC').all(offer.id);
-        const huntAssociations = db.prepare(`
-          SELECT ho.*, h.name as hunt_name FROM hunt_offers ho
-          JOIN hunts h ON h.id = ho.hunt_id WHERE ho.offer_id = ?
-        `).all(offer.id);
-        return jsonResult({ offer, prices, evaluations, alerts, hunt_associations: huntAssociations });
-      }
-
-      return jsonResult({ offer });
-    }
-
-    // Search mode
     const conditions: string[] = [];
     const params: unknown[] = [];
     const joins: string[] = [];
+
+    // Always join prices for the latest price subquery
+    joins.push(`LEFT JOIN (
+      SELECT offer_id, price, shipping, total_landed_gbp, observed_at,
+        ROW_NUMBER() OVER (PARTITION BY offer_id ORDER BY observed_at DESC) AS rn
+      FROM prices
+    ) lp ON lp.offer_id = o.id AND lp.rn = 1`);
 
     if (args.hunt_id) {
       joins.push('JOIN hunt_offers ho ON ho.offer_id = o.id');
@@ -582,43 +722,132 @@ server.tool(
     if (args.watching_only) {
       conditions.push('o.watching = 1');
     }
+    if (args.min_price !== undefined) {
+      conditions.push('lp.total_landed_gbp >= ?');
+      params.push(args.min_price);
+    }
+    if (args.max_price !== undefined) {
+      conditions.push('lp.total_landed_gbp <= ?');
+      params.push(args.max_price);
+    }
 
     const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
     const limit = Math.min(args.limit || 50, 200);
-    const offset = args.offset || 0;
+    const offset = ((args.page || 1) - 1) * limit;
 
-    let query = `SELECT o.* FROM offers o ${joins.join(' ')} ${whereClause} ORDER BY o.last_seen_at DESC LIMIT ? OFFSET ?`;
-    params.push(limit, offset);
+    // Slim triage columns. The json_extract fields are cheap free-text/spec signals that
+    // let the agent triage without a per-row get_offer or any detail fetch — critical for
+    // cars, where the trim/engine/body live in subTitle and extras in attentionGrabber
+    // (the bare title is just make/model). They are null for sources that don't set them.
+    const triageExtras = `json_extract(o.attributes, '$.price_tier') AS price_tier,
+         json_extract(o.attributes, '$.subTitle') AS sub_title,
+         json_extract(o.attributes, '$.attentionGrabber') AS attention_grabber,
+         json_extract(o.attributes, '$.year') AS year,
+         json_extract(o.attributes, '$.distance_miles') AS distance_miles`;
+    const selectCols = args.hunt_id
+      ? `o.id, o.title, o.source_id, o.condition, o.buying_format, o.status, o.last_seen_at,
+         lp.price, lp.shipping, lp.total_landed_gbp,
+         ${triageExtras},
+         ho.status AS hunt_offer_status`
+      : `o.id, o.title, o.source_id, o.condition, o.buying_format, o.status, o.last_seen_at,
+         lp.price, lp.shipping, lp.total_landed_gbp,
+         ${triageExtras}`;
 
-    let offers = db.prepare(query).all(...params) as any[];
+    const query = `SELECT ${selectCols} FROM offers o ${joins.join(' ')} ${whereClause} ORDER BY o.last_seen_at DESC LIMIT ? OFFSET ?`;
+    params.push(limit + 1, offset); // fetch one extra to detect has_more
 
-    // Post-filter by price if needed (requires subquery on latest price)
-    if (args.min_price !== undefined || args.max_price !== undefined) {
-      offers = offers.filter((o: any) => {
-        const latestPrice = db.prepare(
-          'SELECT total_landed_gbp FROM prices WHERE offer_id = ? ORDER BY observed_at DESC LIMIT 1',
-        ).get(o.id) as any;
-        if (!latestPrice?.total_landed_gbp) return false;
-        if (args.min_price !== undefined && latestPrice.total_landed_gbp < args.min_price) return false;
-        if (args.max_price !== undefined && latestPrice.total_landed_gbp > args.max_price) return false;
-        return true;
-      });
+    const rows = db.prepare(query).all(...params) as any[];
+    const hasMore = rows.length > limit;
+    const offers = hasMore ? rows.slice(0, limit) : rows;
+
+    return jsonResult({ offers, count: offers.length, page: args.page || 1, limit, has_more: hasMore });
+  },
+);
+
+// --- Tool 8b: get_offer (single offer deep dive) ---
+
+server.tool(
+  'get_offer',
+  'Get full details for a single offer by ID or source+source_id. Returns all offer fields, latest price, and most recent evaluation. Use list_offers for batch scanning, get_offer_history for price trends.',
+  {
+    offer_id: z.number().optional(),
+    source: z.string().optional(),
+    source_id: z.string().optional(),
+  },
+  async (args) => {
+    let offer: any;
+    if (args.offer_id) {
+      offer = db.prepare('SELECT * FROM offers WHERE id = ?').get(args.offer_id);
+    } else if (args.source && args.source_id) {
+      offer = db.prepare('SELECT * FROM offers WHERE source = ? AND source_id = ?').get(args.source, args.source_id);
+    } else {
+      return errorResult('Provide offer_id or source+source_id');
+    }
+    if (!offer) return errorResult('Offer not found');
+
+    const latestPrice = db.prepare(
+      'SELECT * FROM prices WHERE offer_id = ? ORDER BY observed_at DESC LIMIT 1',
+    ).get(offer.id) || null;
+
+    const lastEvaluation = db.prepare(
+      'SELECT e.*, h.name as hunt_name FROM evaluations e JOIN hunts h ON h.id = e.hunt_id WHERE e.offer_id = ? ORDER BY e.evaluated_at DESC LIMIT 1',
+    ).get(offer.id) || null;
+
+    const huntAssociations = db.prepare(`
+      SELECT ho.hunt_id, ho.status, h.name as hunt_name FROM hunt_offers ho
+      JOIN hunts h ON h.id = ho.hunt_id WHERE ho.offer_id = ?
+    `).all(offer.id);
+
+    return jsonResult({ offer, latest_price: latestPrice, last_evaluation: lastEvaluation, hunt_associations: huntAssociations });
+  },
+);
+
+// --- Tool 8c: get_offer_history (price/evaluation/alert history for one offer) ---
+
+server.tool(
+  'get_offer_history',
+  'Get historical prices, evaluations, or alerts for a single offer. Use when you need price trends for a watched offer or want to review past evaluation decisions.',
+  {
+    offer_id: z.number().describe('Offer ID'),
+    type: z.enum(['prices', 'evaluations', 'alerts']).describe('Which history to fetch'),
+    limit: z.number().min(1).max(100).default(20).describe('Max records to return (default 20)'),
+    page: z.number().min(1).default(1).describe('Page number for pagination'),
+  },
+  async (args) => {
+    const offer = db.prepare('SELECT id FROM offers WHERE id = ?').get(args.offer_id);
+    if (!offer) return errorResult('Offer not found');
+
+    const limit = args.limit;
+    const offset = (args.page - 1) * limit;
+
+    let rows: any[];
+    switch (args.type) {
+      case 'prices':
+        rows = db.prepare(
+          'SELECT price, shipping, currency, total_landed_gbp, observed_at FROM prices WHERE offer_id = ? ORDER BY observed_at DESC LIMIT ? OFFSET ?',
+        ).all(args.offer_id, limit + 1, offset);
+        break;
+      case 'evaluations':
+        rows = db.prepare(
+          'SELECT e.decision, e.reasoning, e.evaluated_at, h.name as hunt_name FROM evaluations e JOIN hunts h ON h.id = e.hunt_id WHERE e.offer_id = ? ORDER BY e.evaluated_at DESC LIMIT ? OFFSET ?',
+        ).all(args.offer_id, limit + 1, offset);
+        break;
+      case 'alerts':
+        rows = db.prepare(
+          'SELECT a.urgency, a.message_sent, a.alerted_at, a.user_response, a.feedback_extracted, a.responded_at, h.name as hunt_name FROM alerts a JOIN hunts h ON h.id = a.hunt_id WHERE a.offer_id = ? ORDER BY a.alerted_at DESC LIMIT ? OFFSET ?',
+        ).all(args.offer_id, limit + 1, offset);
+        break;
     }
 
-    // Attach latest price to each result
-    const results = offers.map((o: any) => {
-      const latestPrice = db.prepare(
-        'SELECT * FROM prices WHERE offer_id = ? ORDER BY observed_at DESC LIMIT 1',
-      ).get(o.id);
-      return { ...o, latest_price: latestPrice || null };
-    });
+    const hasMore = rows.length > limit;
+    const records = hasMore ? rows.slice(0, limit) : rows;
 
-    return jsonResult({ offers: results, count: results.length, offset, limit, has_more: results.length === limit });
+    return jsonResult({ [args.type]: records, count: records.length, page: args.page, limit, has_more: hasMore });
   },
 );
 
 // ============================================================
-// Tool 8: record_evaluation
+// Tool 9: record_evaluation
 // ============================================================
 server.tool(
   'record_evaluation',
@@ -659,7 +888,42 @@ server.tool(
 );
 
 // ============================================================
-// Tool 9: record_alert
+// Tool 9b: batch_dismiss
+// ============================================================
+server.tool(
+  'batch_dismiss',
+  'Dismiss multiple offers in one call. Use during triage to quickly clear obvious mismatches (wrong product, accessories, way over budget) without deep-diving each one.',
+  {
+    hunt_id: z.number(),
+    dismissals: z.array(z.object({
+      offer_id: z.number(),
+      reasoning: z.string().describe('Brief reason, e.g. "accessory not product", "£400 over budget", "wrong category"'),
+    })),
+  },
+  async ({ hunt_id, dismissals }) => {
+    const batchDismiss = db.transaction(() => {
+      const results: Array<{ offer_id: number; status: string }> = [];
+      for (const d of dismissals) {
+        db.prepare(`
+          INSERT INTO evaluations (offer_id, hunt_id, decision, reasoning)
+          VALUES (?, ?, 'skip', ?)
+        `).run(d.offer_id, hunt_id, d.reasoning);
+
+        db.prepare("UPDATE hunt_offers SET status = 'dismissed' WHERE hunt_id = ? AND offer_id = ?")
+          .run(hunt_id, d.offer_id);
+
+        results.push({ offer_id: d.offer_id, status: 'dismissed' });
+      }
+      return results;
+    });
+
+    const results = batchDismiss();
+    return jsonResult({ dismissed: results.length, results });
+  },
+);
+
+// ============================================================
+// Tool 10: record_alert
 // ============================================================
 server.tool(
   'record_alert',
@@ -681,7 +945,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 10: record_alert_response
+// Tool 11: record_alert_response
 // ============================================================
 server.tool(
   'record_alert_response',
@@ -703,7 +967,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 11: get_prices
+// Tool 12: get_prices
 // ============================================================
 server.tool(
   'get_prices',
@@ -780,7 +1044,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 12: record_search
+// Tool 13: record_search
 // ============================================================
 server.tool(
   'record_search',
@@ -804,7 +1068,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 13: search_evaluations
+// Tool 14: search_evaluations
 // ============================================================
 server.tool(
   'search_evaluations',
@@ -860,16 +1124,16 @@ server.tool(
 );
 
 // ============================================================
-// Tool 14: create_market_segment
+// Tool 15: create_market_segment
 // ============================================================
 server.tool(
   'create_market_segment',
-  'Create or update a market segment for a hunt. Segments group items by variant/category for price comparison (e.g. "M90q Gen 1 i5", "Budget tier under £150"). Upserts by (hunt_id, name).',
+  'Create or update a market segment for a hunt. Segments group items by variant/category for price comparison (e.g. "M90q Gen 1 i5", "Budget tier under £150"). Upserts by (hunt_id, name). Returns all hunt segments so you can see existing tag vocabulary.',
   {
     hunt_id: z.number(),
-    name: z.string().describe('Short descriptive name for this grouping'),
+    name: z.string().describe('Short descriptive name for this grouping — also used for offer matching, so include the product name/model'),
     description: z.string().optional().describe('What defines this segment'),
-    tags: z.string().optional().describe('JSON array of attribute tags, e.g. \'["i5-10500T", "16GB", "DDR4"]\''),
+    tags: z.string().optional().describe('JSON array of tags used to match offers to this segment. Include the product model (e.g. "5650G") AND attribute tags (e.g. "ECC-confirmed", "ATX"). Reuse tags from existing segments for consistency — check all_hunt_segments in the response.'),
     filter_patterns: z.string().optional().describe('JSON object of title patterns, condition filters, price hints for future auto-classification'),
     price_low: z.number().optional().describe('Good deal threshold — below this is cheap'),
     price_mid: z.number().optional().describe('Typical/fair market price'),
@@ -901,7 +1165,8 @@ server.tool(
       params.push(existing.id);
       db.prepare(`UPDATE market_segments SET ${sets.join(', ')} WHERE id = ?`).run(...params);
       const updated = db.prepare('SELECT * FROM market_segments WHERE id = ?').get(existing.id);
-      return jsonResult({ action: 'updated', segment: updated });
+      const allSegments = db.prepare('SELECT id, name, tags FROM market_segments WHERE hunt_id = ?').all(args.hunt_id);
+      return jsonResult({ action: 'updated', segment: updated, all_hunt_segments: allSegments });
     } else {
       const result = db.prepare(`
         INSERT INTO market_segments (hunt_id, name, description, tags, filter_patterns, price_low, price_mid, price_high, sample_size, confidence, notes)
@@ -913,13 +1178,14 @@ server.tool(
         args.sample_size ?? 0, args.confidence || 'LOW', args.notes || null,
       );
       const segment = db.prepare('SELECT * FROM market_segments WHERE id = ?').get(result.lastInsertRowid);
-      return jsonResult({ action: 'created', segment });
+      const allSegments = db.prepare('SELECT id, name, tags FROM market_segments WHERE hunt_id = ?').all(args.hunt_id);
+      return jsonResult({ action: 'created', segment, all_hunt_segments: allSegments });
     }
   },
 );
 
 // ============================================================
-// Tool 15: record_baseline_price
+// Tool 16: record_baseline_price
 // ============================================================
 server.tool(
   'record_baseline_price',
@@ -977,7 +1243,7 @@ server.tool(
 );
 
 // ============================================================
-// Tool 16: get_baseline_summary
+// Tool 17: get_baseline_summary
 // ============================================================
 server.tool(
   'get_baseline_summary',
@@ -1024,6 +1290,110 @@ server.tool(
       hunt_name: hunt.name,
       segments,
       unclassified_count: unclassified.count,
+    });
+  },
+);
+
+// ============================================================
+// Tool 18: log_hunt_run
+// ============================================================
+server.tool(
+  'log_hunt_run',
+  'Log a summary of an agent run against a hunt. Call at the end of each invocation with your synthesis — observations, patterns, strategy notes, issues. Per-offer details belong in evaluations, not here.',
+  {
+    hunt_id: z.number(),
+    trigger: z.string().describe('What caused this run: new-offers, price-change, auction-countdown, watch-condition, daily-review, user'),
+    summary: z.string().describe('Agent narrative: search quality observations, market patterns, strategy recommendations, system issues'),
+    offers_evaluated: z.number().optional().default(0),
+    offers_alerted: z.number().optional().default(0),
+    offers_watched: z.number().optional().default(0),
+    offers_skipped: z.number().optional().default(0),
+  },
+  async ({ hunt_id, trigger, summary, offers_evaluated, offers_alerted, offers_watched, offers_skipped }) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(hunt_id);
+    if (!hunt) return errorResult('Hunt not found: ' + hunt_id);
+
+    const result = db.prepare(`
+      INSERT INTO hunt_log (hunt_id, trigger, summary, offers_evaluated, offers_alerted, offers_watched, offers_skipped)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(hunt_id, trigger, summary, offers_evaluated, offers_alerted, offers_watched, offers_skipped);
+
+    return jsonResult({ logged: true, id: result.lastInsertRowid });
+  },
+);
+
+// ============================================================
+// Tool 19: get_hunt_history
+// ============================================================
+server.tool(
+  'get_hunt_history',
+  'Review past activity for a hunt over a time range. Returns agent run summaries, aggregated search stats, evaluation counts, alerts, and offer status changes.',
+  {
+    hunt_id: z.number(),
+    since: z.string().optional().describe('ISO timestamp — default 7 days ago'),
+    until: z.string().optional().describe('ISO timestamp — default now'),
+    limit: z.number().optional().default(50).describe('Max log entries to return'),
+  },
+  async ({ hunt_id, since, until, limit }) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(hunt_id);
+    if (!hunt) return errorResult('Hunt not found: ' + hunt_id);
+
+    const sinceTs = since || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    const untilTs = until || new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+    const logEntries = db.prepare(`
+      SELECT * FROM hunt_log
+      WHERE hunt_id = ? AND logged_at >= ? AND logged_at <= ?
+      ORDER BY logged_at DESC
+      LIMIT ?
+    `).all(hunt_id, sinceTs, untilTs, limit);
+
+    const searchSummary = db.prepare(`
+      SELECT terms,
+        COUNT(*) as search_count,
+        SUM(result_count) as total_results,
+        SUM(new_offer_count) as total_new_offers
+      FROM search_queries
+      WHERE hunt_id = ? AND searched_at >= ? AND searched_at <= ?
+      GROUP BY terms
+      ORDER BY search_count DESC
+    `).all(hunt_id, sinceTs, untilTs);
+
+    const evalRows = db.prepare(`
+      SELECT decision, COUNT(*) as count
+      FROM evaluations
+      WHERE hunt_id = ? AND evaluated_at >= ? AND evaluated_at <= ?
+      GROUP BY decision
+    `).all(hunt_id, sinceTs, untilTs) as Array<{ decision: string; count: number }>;
+
+    const evaluationSummary: Record<string, number> = {};
+    for (const row of evalRows) {
+      evaluationSummary[row.decision] = row.count;
+    }
+
+    const alerts = db.prepare(`
+      SELECT a.id, a.offer_id, o.title as offer_title, a.urgency, a.message_sent, a.alerted_at, a.user_response
+      FROM alerts a
+      JOIN offers o ON o.id = a.offer_id
+      WHERE a.hunt_id = ? AND a.alerted_at >= ? AND a.alerted_at <= ?
+      ORDER BY a.alerted_at DESC
+    `).all(hunt_id, sinceTs, untilTs);
+
+    const statusChanges = db.prepare(`
+      SELECT o.id as offer_id, o.title, o.source_id, o.status, o.last_status_change
+      FROM offers o
+      JOIN hunt_offers ho ON ho.offer_id = o.id
+      WHERE ho.hunt_id = ? AND o.last_status_change >= ? AND o.last_status_change <= ?
+      ORDER BY o.last_status_change DESC
+    `).all(hunt_id, sinceTs, untilTs);
+
+    return jsonResult({
+      period: { since: sinceTs, until: untilTs },
+      log_entries: logEntries,
+      search_summary: searchSummary,
+      evaluation_summary: evaluationSummary,
+      alerts,
+      status_changes: statusChanges,
     });
   },
 );

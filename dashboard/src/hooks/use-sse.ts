@@ -67,7 +67,7 @@ export function useSSE() {
 
     es.addEventListener('new_offers', (e) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.overview });
-      queryClient.invalidateQueries({ queryKey: queryKeys.hunts.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.hunts.all() });
       notifyListeners('new_offers', JSON.parse(e.data));
     });
 

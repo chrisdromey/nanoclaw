@@ -6,7 +6,8 @@
 
 import Database from 'better-sqlite3';
 import { logger } from './logger.js';
-import type { ItemSummary } from './ebay/types.js';
+import type { NormalisedListing } from './sources/types.js';
+import { getVerticals, type VerticalConfig } from './verticals.js';
 
 export interface Hunt {
   id: number;
@@ -18,6 +19,20 @@ export interface Hunt {
   monitoring: number;
   category_ids: string | null;
   created_at: string;
+  vertical: string;
+  sources: string[];
+  poll_interval_minutes: number | null;
+}
+
+/** Parse hunt sources from a raw DB row (sources stored as JSON string). */
+export function parseSourcesFromRow(row: { sources?: string | null }): string[] {
+  try {
+    const parsed = JSON.parse(row.sources ?? '["ebay"]');
+    if (Array.isArray(parsed)) return parsed as string[];
+  } catch {
+    // fall through
+  }
+  return ['ebay'];
 }
 
 export interface SearchTermEntry {
@@ -55,6 +70,22 @@ export interface Offer {
   last_seen_at: string;
   last_status_change: string | null;
   notified_thresholds: string | null;
+  thumbnail_url: string | null;
+  vertical: string | null;
+  attributes: string;  // JSON string; use parseAttributes() to decode
+}
+
+/** Parse attributes JSON from an offer row, with empty-object fallback. */
+export function parseAttributes(raw: string | null | undefined): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw ?? '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    // fall through
+  }
+  return {};
 }
 
 export interface UpsertResult {
@@ -186,6 +217,27 @@ function ensureSchema(db: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS hunt_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hunt_id INTEGER NOT NULL REFERENCES hunts(id),
+      trigger TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      offers_evaluated INTEGER NOT NULL DEFAULT 0,
+      offers_alerted INTEGER NOT NULL DEFAULT 0,
+      offers_watched INTEGER NOT NULL DEFAULT 0,
+      offers_skipped INTEGER NOT NULL DEFAULT 0,
+      logged_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Resolved vertical capabilities, mirrored from config/verticals.yml at watcher startup.
+    -- The container agent (deal-hunter-mcp) reads this table because verticals.yml is not
+    -- mounted in-container, but the DB always is. Single source of truth stays verticals.yml.
+    CREATE TABLE IF NOT EXISTS verticals (
+      name TEXT PRIMARY KEY,
+      config_json TEXT NOT NULL,
+      synced_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE INDEX IF NOT EXISTS idx_offers_source ON offers(source, source_id);
     CREATE INDEX IF NOT EXISTS idx_offers_watching ON offers(watching) WHERE watching = 1;
     CREATE INDEX IF NOT EXISTS idx_offers_status ON offers(status);
@@ -198,6 +250,7 @@ function ensureSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_market_segments_hunt ON market_segments(hunt_id);
     CREATE INDEX IF NOT EXISTS idx_baseline_prices_hunt ON baseline_prices(hunt_id);
     CREATE INDEX IF NOT EXISTS idx_baseline_prices_segment ON baseline_prices(segment_id);
+    CREATE INDEX IF NOT EXISTS idx_hunt_log_hunt ON hunt_log(hunt_id, logged_at);
   `);
 
   // Migrations — add columns that were introduced after initial schema
@@ -219,6 +272,36 @@ function ensureSchema(db: Database.Database): void {
   if (!offerCols.some((c) => c.name === 'notified_thresholds')) {
     db.exec("ALTER TABLE offers ADD COLUMN notified_thresholds TEXT DEFAULT '[]'");
   }
+  if (!offerCols.some((c) => c.name === 'thumbnail_url')) {
+    db.exec('ALTER TABLE offers ADD COLUMN thumbnail_url TEXT');
+  }
+  if (!offerCols.some((c) => c.name === 'vertical')) {
+    db.exec('ALTER TABLE offers ADD COLUMN vertical TEXT');
+  }
+  if (!offerCols.some((c) => c.name === 'attributes')) {
+    db.exec("ALTER TABLE offers ADD COLUMN attributes TEXT DEFAULT '{}'");
+  }
+
+  // hunts table: vertical, sources, poll_interval_minutes
+  if (!huntCols.some((c) => c.name === 'vertical')) {
+    db.exec("ALTER TABLE hunts ADD COLUMN vertical TEXT NOT NULL DEFAULT 'computers'");
+  }
+  if (!huntCols.some((c) => c.name === 'sources')) {
+    db.exec('ALTER TABLE hunts ADD COLUMN sources TEXT NOT NULL DEFAULT \'["ebay"]\'');
+  }
+  if (!huntCols.some((c) => c.name === 'poll_interval_minutes')) {
+    db.exec('ALTER TABLE hunts ADD COLUMN poll_interval_minutes INTEGER');
+  }
+
+  // search_queries table: consecutive_failures per (hunt_id, source)
+  const sqCols = db.prepare("PRAGMA table_info('search_queries')").all() as Array<{ name: string }>;
+  if (!sqCols.some((c) => c.name === 'consecutive_failures')) {
+    db.exec('ALTER TABLE search_queries ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0');
+  }
+
+  // One-time migration: backfill legacy eBay offers that were inserted before vertical column existed.
+  // Idempotent — rows that already have a vertical are untouched.
+  db.exec("UPDATE offers SET vertical = 'computers' WHERE vertical IS NULL AND source = 'ebay'");
 }
 
 export function openDatabase(dbPath: string): Database.Database {
@@ -226,19 +309,101 @@ export function openDatabase(dbPath: string): Database.Database {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
+
+  // Count rows that need migration before ensureSchema sets defaults
+  const preCount = (() => {
+    try {
+      const huntCols = db.prepare("PRAGMA table_info('hunts')").all() as Array<{ name: string }>;
+      if (!huntCols.some((c) => c.name === 'vertical')) {
+        const row = db.prepare('SELECT COUNT(*) as n FROM hunts').get() as { n: number };
+        return row.n;
+      }
+    } catch {
+      // table may not exist yet
+    }
+    return 0;
+  })();
+
   ensureSchema(db);
+
+  if (preCount > 0) {
+    logger.info(
+      { count: preCount },
+      "Migrated legacy hunts to vertical='computers', sources=[\"ebay\"]",
+    );
+  }
+
+  syncVerticals(db);
+
   logger.info({ dbPath }, 'Database ready');
   return db;
+}
+
+/**
+ * Mirror resolved vertical capabilities from config/verticals.yml into the `verticals` table
+ * so the container agent (which can't read verticals.yml) can resolve them via the DB MCP.
+ * Idempotent: replaces all rows each startup and prunes verticals removed from the config.
+ * Defensive: a missing/invalid verticals.yml logs a warning and leaves the table untouched.
+ */
+export function syncVerticals(db: Database.Database): void {
+  let verticals: Map<string, VerticalConfig>;
+  try {
+    verticals = getVerticals();
+  } catch (err) {
+    logger.warn({ err }, 'Could not load verticals.yml — leaving verticals table unchanged');
+    return;
+  }
+
+  const upsert = db.prepare(
+    `INSERT INTO verticals (name, config_json, synced_at) VALUES (?, ?, datetime('now'))
+     ON CONFLICT(name) DO UPDATE SET config_json = excluded.config_json, synced_at = excluded.synced_at`,
+  );
+  const names = [...verticals.keys()];
+  const sync = db.transaction(() => {
+    for (const [name, cfg] of verticals) {
+      upsert.run(name, JSON.stringify(cfg));
+    }
+    // Prune verticals that no longer exist in the config.
+    const placeholders = names.map(() => '?').join(',');
+    if (names.length > 0) {
+      db.prepare(`DELETE FROM verticals WHERE name NOT IN (${placeholders})`).run(...names);
+    } else {
+      db.prepare('DELETE FROM verticals').run();
+    }
+  });
+  sync();
+  logger.info({ count: names.length, verticals: names }, 'Synced vertical capabilities to DB');
 }
 
 // --- Read operations ---
 
 export function getActiveHunts(db: Database.Database): Hunt[] {
-  return db.prepare("SELECT * FROM hunts WHERE status = 'active' AND monitoring = 1").all() as Hunt[];
+  const rows = db.prepare("SELECT * FROM hunts WHERE status = 'active' AND monitoring = 1").all() as Array<Omit<Hunt, 'sources'> & { sources: string }>;
+  return rows.map((row) => ({
+    ...row,
+    sources: parseSourcesFromRow(row),
+    poll_interval_minutes: row.poll_interval_minutes ?? null,
+  }));
+}
+
+export function getSegmentCount(db: Database.Database, huntId: number): number {
+  const row = db.prepare('SELECT COUNT(*) as count FROM market_segments WHERE hunt_id = ?').get(huntId) as { count: number };
+  return row.count;
 }
 
 export function getWatchedOffers(db: Database.Database): Offer[] {
   return db.prepare("SELECT * FROM offers WHERE watching = 1 AND status = 'active'").all() as Offer[];
+}
+
+export function getStaleOffers(db: Database.Database, staleHours: number): Offer[] {
+  return db
+    .prepare(
+      `SELECT * FROM offers
+       WHERE status = 'active' AND watching = 0
+         AND datetime(last_seen_at) < datetime('now', '-' || ? || ' hours')
+       ORDER BY last_seen_at ASC`,
+    )
+    .all(staleHours) as Offer[];
 }
 
 export function getOfferBySourceId(db: Database.Database, source: string, sourceId: string): Offer | undefined {
@@ -256,10 +421,19 @@ export function getLatestPrice(
     .get(offerId) as { price: number; shipping: number | null; total_landed_gbp: number | null; observed_at: string } | undefined;
 }
 
-export function getLastSearchTime(db: Database.Database, huntId: number, terms: string): string | undefined {
+export function getLastSearchTime(
+  db: Database.Database,
+  huntId: number,
+  source: string,
+  terms: string,
+): string | undefined {
+  // search_queries records the source per row, so we scope by (hunt_id, source, terms)
+  // to match the scheduler's per-(hunt:source:terms) cadence keying. Without the source
+  // filter, a never-searched source would inherit another source's recent searched_at and
+  // be wrongly skipped on restart.
   const row = db
-    .prepare('SELECT MAX(searched_at) as last FROM search_queries WHERE hunt_id = ? AND terms = ?')
-    .get(huntId, terms) as { last: string | null } | undefined;
+    .prepare('SELECT MAX(searched_at) as last FROM search_queries WHERE hunt_id = ? AND source = ? AND terms = ?')
+    .get(huntId, source, terms) as { last: string | null } | undefined;
   return row?.last ?? undefined;
 }
 
@@ -271,54 +445,75 @@ export function getHuntIdsForOffer(db: Database.Database, offerId: number): numb
 }
 
 export function getHunt(db: Database.Database, huntId: number): Hunt | undefined {
-  return db.prepare('SELECT * FROM hunts WHERE id = ?').get(huntId) as Hunt | undefined;
+  const row = db.prepare('SELECT * FROM hunts WHERE id = ?').get(huntId) as (Omit<Hunt, 'sources'> & { sources: string }) | undefined;
+  if (!row) return undefined;
+  return { ...row, sources: parseSourcesFromRow(row), poll_interval_minutes: row.poll_interval_minutes ?? null };
 }
 
 // --- Write operations ---
 
-/** Upsert an offer from eBay search results. Returns the offer ID and whether it was new. */
-export function upsertOffer(db: Database.Database, item: ItemSummary): UpsertResult {
-  const source = 'ebay';
-  const sourceId = item.itemId;
-  const existing = db.prepare('SELECT id FROM offers WHERE source = ? AND source_id = ?').get(source, sourceId) as
-    | { id: number }
-    | undefined;
+/**
+ * Upsert a NormalisedListing into the offers table.
+ * Used by all source adapters (eBay, AutoTrader, future sources).
+ * Returns the offer row id and whether the row was newly inserted.
+ */
+export function upsertNormalisedListing(
+  db: Database.Database,
+  listing: NormalisedListing,
+  vertical: string,
+): UpsertResult {
+  const existing = db.prepare('SELECT id FROM offers WHERE source = ? AND source_id = ?').get(
+    listing.source, listing.sourceId,
+  ) as { id: number } | undefined;
+
+  // Fold the top-level sellerType into the attributes JSON under `seller_type` so it
+  // survives a DB round-trip (there is no dedicated seller_type column). The uppercase
+  // value ('TRADE'/'PRIVATE') is preserved. Only set when present, so an enrichment-supplied
+  // attributes.seller_type isn't clobbered by a null top-level value.
+  const attributesObj: Record<string, unknown> = { ...(listing.attributes ?? {}) };
+  if (listing.sellerType != null) {
+    attributesObj['seller_type'] = listing.sellerType;
+  }
+  const attributesJson = JSON.stringify(attributesObj);
 
   if (existing) {
     const sets: string[] = ["last_seen_at = datetime('now')"];
     const params: unknown[] = [];
 
-    if (item.title) { sets.push('title = ?'); params.push(item.title); }
-    if (item.seller?.username) { sets.push('seller = ?'); params.push(item.seller.username); }
-    if (item.seller?.feedbackScore != null) { sets.push('seller_rating = ?'); params.push(parseFloat(item.seller.feedbackPercentage || '0')); }
-    if (item.condition) { sets.push('condition = ?'); params.push(item.condition); }
-    if (item.buyingOptions?.length) { sets.push('buying_format = ?'); params.push(item.buyingOptions.join(',')); }
-    if (item.itemEndDate) { sets.push('auction_end_time = ?'); params.push(item.itemEndDate); }
-    if (item.bidCount != null) { sets.push('bid_count = ?'); params.push(item.bidCount); }
+    sets.push('title = ?'); params.push(listing.title);
+    sets.push('url = ?'); params.push(listing.url || null);
+    sets.push('vertical = ?'); params.push(vertical);
+    sets.push('attributes = ?'); params.push(attributesJson);
+    if (listing.thumbnailUrl != null) { sets.push('thumbnail_url = ?'); params.push(listing.thumbnailUrl); }
+    if (listing.condition != null) { sets.push('condition = ?'); params.push(listing.condition); }
+    if (listing.buyingFormat != null) { sets.push('buying_format = ?'); params.push(listing.buyingFormat); }
+    if (listing.auctionEndTime != null) { sets.push('auction_end_time = ?'); params.push(listing.auctionEndTime); }
+    if (listing.bidCount != null) { sets.push('bid_count = ?'); params.push(listing.bidCount); }
 
     params.push(existing.id);
     db.prepare(`UPDATE offers SET ${sets.join(', ')} WHERE id = ?`).run(...params);
     return { offerId: existing.id, isNew: false };
   }
 
-  const buyingFormat = item.buyingOptions?.join(',') || null;
   const result = db
     .prepare(
-      `INSERT INTO offers (source, source_id, title, url, seller, seller_rating, condition,
-       buying_format, auction_end_time, bid_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO offers
+         (source, source_id, title, url, vertical, attributes,
+          condition, buying_format, auction_end_time, bid_count, thumbnail_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
-      source,
-      sourceId,
-      item.title,
-      item.itemWebUrl || null,
-      item.seller?.username || null,
-      item.seller?.feedbackPercentage ? parseFloat(item.seller.feedbackPercentage) : null,
-      item.condition || null,
-      buyingFormat,
-      item.itemEndDate || null,
-      item.bidCount ?? null,
+      listing.source,
+      listing.sourceId,
+      listing.title,
+      listing.url || null,
+      vertical,
+      attributesJson,
+      listing.condition ?? null,
+      listing.buyingFormat ?? null,
+      listing.auctionEndTime ?? null,
+      listing.bidCount ?? null,
+      listing.thumbnailUrl ?? null,
     );
 
   return { offerId: result.lastInsertRowid as number, isNew: true };
@@ -382,6 +577,30 @@ export function addNotifiedThreshold(db: Database.Database, offerId: number, thr
   }
 }
 
+/**
+ * Merge-update the attributes JSON for an offer identified by (source, source_id).
+ * Incoming fields are merged on top of the existing attributes — existing fields
+ * not in the update are preserved. Used by the scheduler's fetchDetail enrichment.
+ */
+export function mergeOfferAttributes(
+  db: Database.Database,
+  source: string,
+  sourceId: string,
+  attrs: Record<string, unknown>,
+): void {
+  const row = db.prepare('SELECT id, attributes FROM offers WHERE source = ? AND source_id = ?').get(source, sourceId) as
+    | { id: number; attributes: string }
+    | undefined;
+  if (!row) return;
+
+  const existing = parseAttributes(row.attributes);
+  const merged = { ...existing, ...attrs };
+  db.prepare("UPDATE offers SET attributes = ?, last_seen_at = datetime('now') WHERE id = ?").run(
+    JSON.stringify(merged),
+    row.id,
+  );
+}
+
 export function updateOfferWatchFields(
   db: Database.Database,
   offerId: number,
@@ -395,40 +614,44 @@ export function updateOfferWatchFields(
   db.prepare(`UPDATE offers SET ${sets.join(', ')} WHERE id = ?`).run(...params);
 }
 
-/** Run a full search result write as a transaction (upsert offers, record prices, associate with hunt). */
-export function applySearchResults(
+/**
+ * Run a full search result write as a transaction.
+ * Upserts NormalisedListings, records prices, associates with hunt.
+ * Used by all sources (eBay, AutoTrader, etc.).
+ */
+export function applyNormalisedResults(
   db: Database.Database,
   huntId: number,
+  source: string,
+  vertical: string,
   terms: string,
-  items: ItemSummary[],
-): { newCount: number; totalCount: number; searchQueryId: number } {
+  listings: NormalisedListing[],
+): { newCount: number; totalCount: number; searchQueryId: number; newSourceIds: string[] } {
   let newCount = 0;
+  const newSourceIds: string[] = [];
 
   const run = db.transaction(() => {
-    const searchQueryId = recordSearch(db, huntId, 'ebay', terms, items.length, 0); // newCount updated after
+    const searchQueryId = recordSearch(db, huntId, source, terms, listings.length, 0);
 
-    for (const item of items) {
-      const { offerId, isNew } = upsertOffer(db, item);
-      if (isNew) newCount++;
+    for (const listing of listings) {
+      const { offerId, isNew } = upsertNormalisedListing(db, listing, vertical);
+      if (isNew) {
+        newCount++;
+        newSourceIds.push(listing.sourceId);
+      }
 
-      // Record price observation
-      const priceVal = item.currentBidPrice?.value || item.price?.value;
-      if (priceVal) {
-        const price = parseFloat(priceVal);
-        const shippingVal = item.shippingOptions?.[0]?.shippingCost?.value;
-        const shipping = shippingVal ? parseFloat(shippingVal) : null;
-        recordPrice(db, offerId, price, shipping);
+      if (listing.priceGbp != null) {
+        recordPrice(db, offerId, listing.priceGbp, null, listing.currency ?? 'GBP');
       }
 
       associateOfferWithHunt(db, huntId, offerId, searchQueryId);
     }
 
-    // Update the search query with actual new count
     db.prepare('UPDATE search_queries SET new_offer_count = ? WHERE id = ?').run(newCount, searchQueryId);
 
     return searchQueryId;
   });
 
   const searchQueryId = run();
-  return { newCount, totalCount: items.length, searchQueryId };
+  return { newCount, totalCount: listings.length, searchQueryId, newSourceIds };
 }

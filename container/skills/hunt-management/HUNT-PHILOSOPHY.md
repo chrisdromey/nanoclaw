@@ -57,4 +57,4 @@ These are signs you've fallen into waterfall thinking:
 
 - **Asking the user lots of questions before showing them anything.** Show them the market early. Their reactions to real listings will answer most of your questions more reliably than abstract preferences.
 
-- **Skipping baselining because you "already know" the prices.** Your training knowledge is stale. eBay sold data is ground truth. Every hunt — even a simple single-product search — needs market segments and baseline prices recorded to the database. Without them, the dashboard is empty and your value judgements are based on guesses, not data.
+- **Skipping baselining because you "already know" the prices.** Your training knowledge is stale. Live market data is ground truth. Every hunt — even a simple single-product search — needs market segments and baseline prices recorded to the database. Without them, the dashboard is empty and your value judgements are based on guesses, not data.

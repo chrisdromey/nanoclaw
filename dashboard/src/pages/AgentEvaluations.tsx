@@ -58,19 +58,16 @@ export default function AgentEvaluations() {
   // Transform trend for stacked area
   const trendData = (() => {
     if (!data?.trend.length) return [];
-    const byDay = new Map<string, Record<string, number>>();
-    for (const t of data.trend) {
-      if (!byDay.has(t.day)) byDay.set(t.day, { alert: 0, watch: 0, skip: 0 });
-      byDay.get(t.day)![t.decision] = t.count;
-    }
-    return Array.from(byDay.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([day, counts]) => ({
-        date: new Date(day + 'T00:00:00Z').toLocaleDateString('en-GB', {
+    return [...data.trend]
+      .sort((a, b) => a.day.localeCompare(b.day))
+      .map((t) => ({
+        date: new Date(t.day + 'T00:00:00Z').toLocaleDateString('en-GB', {
           day: 'numeric',
           month: 'short',
         }),
-        ...counts,
+        alert: t.alert,
+        watch: t.watch,
+        skip: t.skip,
       }));
   })();
 

@@ -1,0 +1,64 @@
+{
+  "probes": [
+    {
+      "probe": 1,
+      "label": "priceIndicatorRating scalar",
+      "status": 400,
+      "text": "[{\"errors\":[{\"message\":\"Cannot query field \\\"priceIndicatorRating\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":24,\"column\":9}],\"extensions\":{\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"exception\":{\"message\":\"Cannot query field \\\"priceIndicatorRating\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":24,\"column\":9}]}}},{\"message\":\"Cannot query field \\\"priceIndicatorRatingLabel\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":25,\"column\":9}],\"extensions\":{\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"except",
+      "cfMitigated": null
+    },
+    {
+      "probe": 2,
+      "label": "priceIndicator nested object",
+      "status": 400,
+      "text": "[{\"errors\":[{\"message\":\"Cannot query field \\\"priceIndicator\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":24,\"column\":9}],\"extensions\":{\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"exception\":{\"message\":\"Cannot query field \\\"priceIndicator\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":24,\"column\":9}]}}}]}\n]",
+      "cfMitigated": null
+    },
+    {
+      "probe": 3,
+      "label": "alt field names",
+      "status": 400,
+      "text": "[{\"errors\":[{\"message\":\"Cannot query field \\\"priceRating\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":24,\"column\":9}],\"extensions\":{\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"exception\":{\"message\":\"Cannot query field \\\"priceRating\\\" on type \\\"SearchListing\\\".\",\"locations\":[{\"line\":24,\"column\":9}]}}},{\"message\":\"Cannot query field \\\"dealRating\\\" on type \\\"SearchListing\\\". Did you mean \\\"dealerLink\\\"?\",\"locations\":[{\"line\":25,\"column\":9}],\"extensions\":{\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"exception\"",
+      "cfMitigated": null
+    },
+    {
+      "probe": 4,
+      "label": "introspect SearchListing",
+      "status": 400,
+      "cfMitigated": null,
+      "text": "[{\"errors\":[{\"message\":\"GraphQL introspection is not allowed by Apollo Server, but the query contained __schema or __type. To enable introspection, pass introspection: true to ApolloServer in production\",\"locations\":[{\"line\":2,\"column\":3}],\"extensions\":{\"validationErrorCode\":\"INTROSPECTION_DISABLED\",\"code\":\"GRAPHQL_VALIDATION_FAILED\",\"exception\":{\"message\":\"GraphQL introspection is not allowed by Apollo Server, but the query contained __schema or __type. To enable introspection, pass introspecti"
+    }
+  ],
+  "rateLimit": [
+    {
+      "seq": 1,
+      "status": 200,
+      "cfMitigated": "none",
+      "bytes": 1055
+    },
+    {
+      "seq": 2,
+      "status": 200,
+      "cfMitigated": "none",
+      "bytes": 1055
+    },
+    {
+      "seq": 3,
+      "status": 200,
+      "cfMitigated": "none",
+      "bytes": 1055
+    },
+    {
+      "seq": 4,
+      "status": 200,
+      "cfMitigated": "none",
+      "bytes": 1055
+    },
+    {
+      "seq": 5,
+      "status": 200,
+      "cfMitigated": "none",
+      "bytes": 1055
+    }
+  ]
+}

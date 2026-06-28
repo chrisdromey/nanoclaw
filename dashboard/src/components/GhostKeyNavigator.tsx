@@ -13,7 +13,7 @@ const shortcuts: Record<string, { path: string; label: string }> = {
 export default function GhostKeyNavigator() {
   const [visible, setVisible] = useState(false);
   const navigate = useNavigate();
-  const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const waitingRef = useRef(false);
 
   const handleKeyDown = useCallback(

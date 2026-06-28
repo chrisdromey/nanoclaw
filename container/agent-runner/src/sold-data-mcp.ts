@@ -38,17 +38,15 @@ interface SoldItem {
   title: string;
   sold_price: number;
   shipping: number;
-  currency: string;
   condition: string;
   sold_date: string;
-  url: string;
   item_id: string;
-  price_is_range: boolean;
 }
 
 interface ScrapeResult {
   items: SoldItem[];
   pages_fetched: number;
+  has_more: boolean;
   errors: string[];
 }
 
@@ -76,10 +74,10 @@ function randomUserAgent(): string {
 
 // --- URL Builder ---
 
-function buildSearchUrl(terms: string, page: number, categoryId: number): string {
+function buildSearchUrl(terms: string, page: number): string {
   const params = new URLSearchParams({
     _nkw: terms,
-    _sacat: String(categoryId),
+    _sacat: '0',
     rt: 'nc',
     LH_Sold: '1',
     LH_Complete: '1',
@@ -187,7 +185,7 @@ async function fetchPage(url: string): Promise<string> {
 
 // --- Parsers ---
 
-function parsePrice(text: string): { value: number; isRange: boolean } | null {
+function parsePrice(text: string): number | null {
   if (!text) return null;
 
   const cleaned = text.replace(/[£,]/g, '').trim();
@@ -200,12 +198,12 @@ function parsePrice(text: string): { value: number; isRange: boolean } | null {
     const parts = cleaned.split(/\s+to\s+/i);
     const high = parseFloat(parts[parts.length - 1].replace(/[^\d.]/g, ''));
     if (isNaN(high)) return null;
-    return { value: high, isRange: true };
+    return high;
   }
 
   const value = parseFloat(cleaned.replace(/[^\d.]/g, ''));
   if (isNaN(value)) return null;
-  return { value, isRange: false };
+  return value;
 }
 
 function parseSoldDate(text: string): string | null {
@@ -270,8 +268,8 @@ function parseCardLayout($: cheerio.CheerioAPI): SoldItem[] {
 
     // Price — .s-card__price class on a span
     const priceText = $el.find('.s-card__price').first().text().trim();
-    const parsed = parsePrice(priceText);
-    if (!parsed) return;
+    const price = parsePrice(priceText);
+    if (price === null) return;
 
     // Sold date — .s-card__caption contains "Sold  19 Mar 2026"
     const captionText = $el.find('.s-card__caption .su-styled-text').first().text().trim();
@@ -293,32 +291,21 @@ function parseCardLayout($: cheerio.CheerioAPI): SoldItem[] {
     // Condition — .s-card__subtitle
     const condition = $el.find('.s-card__subtitle .su-styled-text').first().text().trim() || 'Unknown';
 
-    // URL — from the link wrapping the title heading
-    let url = '';
+    // Extract item ID from the link wrapping the title heading
     const titleLink = $el.find('a.s-card__link').filter((_, a) => {
       return $(a).find('.s-card__title').length > 0;
     }).first();
-    if (titleLink.length) {
-      url = titleLink.attr('href') || '';
-    }
-    // Strip tracking params but keep the item path
-    const qIndex = url.indexOf('?');
-    if (qIndex !== -1) url = url.slice(0, qIndex);
-
-    // Extract item ID from URL (e.g. https://www.ebay.co.uk/itm/127752453280)
-    const itemIdMatch = url.match(/\/itm\/(\d+)/);
+    const href = titleLink.attr('href') || '';
+    const itemIdMatch = href.match(/\/itm\/(\d+)/);
     const itemId = itemIdMatch ? itemIdMatch[1] : '';
 
     items.push({
       title,
-      sold_price: parsed.value,
+      sold_price: price,
       shipping,
-      currency: 'GBP',
       condition,
       sold_date: soldDate || '',
-      url,
       item_id: itemId,
-      price_is_range: parsed.isRange,
     });
   });
 
@@ -335,8 +322,8 @@ function parseLegacyLayout($: cheerio.CheerioAPI): SoldItem[] {
     if (!title || title === 'Shop on eBay' || title.startsWith('Shop on eBay')) return;
 
     const priceText = $el.find('.s-item__price').first().text().trim();
-    const parsed = parsePrice(priceText);
-    if (!parsed) return;
+    const price = parsePrice(priceText);
+    if (price === null) return;
 
     const soldDateText = $el.find('.POSITIVE').first().text().trim();
     const soldDate = parseSoldDate(soldDateText);
@@ -346,23 +333,17 @@ function parseLegacyLayout($: cheerio.CheerioAPI): SoldItem[] {
 
     const condition = $el.find('.SECONDARY_INFO').first().text().trim() || 'Unknown';
 
-    let url = $el.find('.s-item__link').first().attr('href') || '';
-    const qIndex = url.indexOf('?');
-    if (qIndex !== -1) url = url.slice(0, qIndex);
-
-    const itemIdMatch = url.match(/\/itm\/(\d+)/);
+    const href = $el.find('.s-item__link').first().attr('href') || '';
+    const itemIdMatch = href.match(/\/itm\/(\d+)/);
     const itemId = itemIdMatch ? itemIdMatch[1] : '';
 
     items.push({
       title,
-      sold_price: parsed.value,
+      sold_price: price,
       shipping,
-      currency: 'GBP',
       condition,
       sold_date: soldDate || '',
-      url,
       item_id: itemId,
-      price_is_range: parsed.isRange,
     });
   });
 
@@ -400,15 +381,15 @@ async function scrapeEbaySold(
   searchTerms: string,
   daysBack: number,
   maxResults: number,
-  categoryId: number,
+  page: number,
 ): Promise<ScrapeResult> {
   const errors: string[] = [];
   let allItems: SoldItem[] = [];
-  const pagesNeeded = Math.min(Math.ceil(maxResults / ITEMS_PER_PAGE), MAX_PAGES);
+  const pagesNeeded = Math.min(Math.ceil((page * maxResults) / ITEMS_PER_PAGE), MAX_PAGES);
 
-  for (let page = 1; page <= pagesNeeded; page++) {
-    const url = buildSearchUrl(searchTerms, page, categoryId);
-    log(`Fetching page ${page}/${pagesNeeded}: ${url}`);
+  for (let ebayPage = 1; ebayPage <= pagesNeeded; ebayPage++) {
+    const url = buildSearchUrl(searchTerms, ebayPage);
+    log(`Fetching page ${ebayPage}/${pagesNeeded}: ${url}`);
 
     try {
       const html = await fetchPage(url);
@@ -416,25 +397,25 @@ async function scrapeEbaySold(
       errors.push(...warnings);
 
       if (items.length === 0) {
-        log(`Page ${page} returned no items, stopping pagination`);
+        log(`Page ${ebayPage} returned no items, stopping pagination`);
         break;
       }
 
       allItems.push(...items);
-      log(`Page ${page}: parsed ${items.length} items (total: ${allItems.length})`);
+      log(`Page ${ebayPage}: parsed ${items.length} items (total: ${allItems.length})`);
 
       // Rate limit before next page
-      if (page < pagesNeeded) {
+      if (ebayPage < pagesNeeded) {
         await delay(RATE_LIMIT_MS);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      errors.push(`Page ${page}: ${msg}`);
-      log(`Page ${page} error: ${msg}`);
+      errors.push(`Page ${ebayPage}: ${msg}`);
+      log(`Page ${ebayPage} error: ${msg}`);
 
       // If page 1 fails, we have nothing — propagate
-      if (page === 1) {
-        return { items: [], pages_fetched: 0, errors };
+      if (ebayPage === 1) {
+        return { items: [], pages_fetched: 0, has_more: false, errors };
       }
       // Otherwise, return what we have from earlier pages
       break;
@@ -453,17 +434,20 @@ async function scrapeEbaySold(
     });
   }
 
-  // Truncate to max_results
-  if (allItems.length > maxResults) {
-    allItems = allItems.slice(0, maxResults);
-  }
+  // Paginate results
+  const offset = (page - 1) * maxResults;
+  const hasMore = allItems.length > offset + maxResults;
+  allItems = allItems.slice(offset, offset + maxResults);
+
+  const ebayPagesFetched = Math.min(errors.filter(e => e.startsWith('Page')).length > 0
+    ? Math.max(1, allItems.length > 0 ? Math.ceil(allItems.length / ITEMS_PER_PAGE) : 0)
+    : Math.min(pagesNeeded, Math.ceil((allItems.length || 1) / ITEMS_PER_PAGE)),
+    pagesNeeded);
 
   return {
     items: allItems,
-    pages_fetched: Math.min(errors.filter(e => e.startsWith('Page')).length > 0
-      ? Math.max(1, allItems.length > 0 ? Math.ceil(allItems.length / ITEMS_PER_PAGE) : 0)
-      : Math.min(pagesNeeded, Math.ceil((allItems.length || 1) / ITEMS_PER_PAGE)),
-      pagesNeeded),
+    pages_fetched: ebayPagesFetched,
+    has_more: hasMore,
     errors,
   };
 }
@@ -483,16 +467,16 @@ server.tool(
     search_terms: z.string().describe('Search query (e.g. "lenovo m90q gen 3")'),
     marketplace: z.string().default('ebay_gb').describe('Marketplace ID (only ebay_gb supported)'),
     days_back: z.number().min(1).max(90).default(90).describe('How far back to look (max 90 days)'),
-    max_results: z.number().min(1).max(600).default(200).describe('Maximum items to return'),
-    category_id: z.number().default(0).describe('eBay category ID (0 = all categories)'),
+    max_results: z.number().min(1).max(600).default(50).describe('Maximum items to return per page'),
+    page: z.number().min(1).default(1).describe('Page number for pagination (each page returns max_results items)'),
   },
-  async ({ search_terms, marketplace, days_back, max_results, category_id }) => {
+  async ({ search_terms, marketplace, days_back, max_results, page }) => {
     if (marketplace !== 'ebay_gb') {
       return errorResult(`Unsupported marketplace: ${marketplace}. Only ebay_gb is supported.`);
     }
 
-    log(`get_sold_prices: "${search_terms}" (${days_back}d, max ${max_results})`);
-    const result = await scrapeEbaySold(search_terms, days_back, max_results, category_id);
+    log(`get_sold_prices: "${search_terms}" (${days_back}d, max ${max_results}, page ${page})`);
+    const result = await scrapeEbaySold(search_terms, days_back, max_results, page);
 
     if (result.items.length === 0 && result.errors.length > 0) {
       return errorResult(result.errors.join('; '));
@@ -503,8 +487,12 @@ server.tool(
       meta: {
         search_terms,
         marketplace,
+        currency: 'GBP',
         days_back,
+        page,
+        max_results,
         total_fetched: result.items.length,
+        has_more: result.has_more,
         pages_fetched: result.pages_fetched,
         errors: result.errors.length > 0 ? result.errors : undefined,
       },

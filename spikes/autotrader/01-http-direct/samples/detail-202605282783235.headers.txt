@@ -1,0 +1,29 @@
+Status: 200
+Final URL: https://www.autotrader.co.uk/car-details/202605282783235
+
+cache-control: no-store,private, no-cache, max-age=0, must-revalidate
+cf-cache-status: DYNAMIC
+cf-ray: a12870d4183bbe88-MAN
+connection: keep-alive
+content-encoding: gzip
+content-security-policy: upgrade-insecure-requests; report-uri https://app.csp-report-receiver.prod.k8.atcloud.io/api/csp/report-uri; report-to autotrader-csp;
+content-type: text/html;charset=utf-8
+date: Sun, 28 Jun 2026 00:05:36 GMT
+link: <https://apm-assets.prod.atcdn.co.uk/elastic-apm-rum.umd.min.js>; rel="prefetch"
+referrer-policy: origin-when-cross-origin
+reporting-endpoints: autotrader-csp="https://app.csp-report-receiver.prod.k8.atcloud.io/api/csp/report-to"
+server: cloudflare
+set-cookie: bucket=desktop; Domain=.autotrader.co.uk; path=/;
+set-cookie: abTestGroups=; Path=/; Expires=Sat, 27 Jun 2026 00:05:36 GMT
+set-cookie: userid=ID=ecc44a44-4715-4bef-ad87-c1c0c08f4d68; Path=/; Expires=Mon, 28 Jun 2027 00:05:36 GMT; Domain=.autotrader.co.uk; Secure
+set-cookie: user=STATUS=0&HASH=4dd08bd17ecb9044d90c92155442eb60&PR=&ID=ecc44a44-4715-4bef-ad87-c1c0c08f4d68; Path=/; Expires=Mon, 28 Jun 2027 00:05:36 GMT; Domain=.autotrader.co.uk; Secure
+set-cookie: __cf_bm=7tKSeitVjJMpL9FaLoLX7xXPNC9630jtKs8fK9MbNl8-1782605136.0111926-1.0.1.1-Z37iA.KfBysGLYlnbYOmgqS5k8ai8GNI5e4K_OVImnFEo_0iWIVSYmThNfNjiW_jOdCBBMDHthJRYsVN2RIo7PZ9orCYKYGD8YSfiO7qgeQ46.ON3qrXxX_5Pnui0idb; HttpOnly; SameSite=None; Secure; Path=/; Domain=www.autotrader.co.uk; Expires=Sun, 28 Jun 2026 00:35:36 GMT
+strict-transport-security: max-age=31536000
+transfer-encoding: chunked
+vary: Accept-Encoding, accept-encoding, Accept-Encoding
+x-at-service: sauron-adverts-app
+x-atcloud-response-service: consumer-gateway
+x-content-type-options: nosniff
+x-frame-options: SAMEORIGIN
+x-request-id: a12870d4183bbe88
+x-xss-protection: 1; mode=block

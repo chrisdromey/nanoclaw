@@ -18,7 +18,7 @@ import { z } from 'zod';
 const BROWSE_API_BASE = 'https://api.ebay.com/buy/browse/v1/item_summary/search';
 const BUYING_FORMATS = ['AUCTION', 'FIXED_PRICE', 'BEST_OFFER'] as const;
 const DEFAULT_MARKETPLACE = 'EBAY_GB';
-const DEFAULT_LIMIT = 50;
+const DEFAULT_LIMIT = 30;
 const MAX_LIMIT = 200;
 
 const ACCESS_TOKEN = process.env.EBAY_ACCESS_TOKEN || '';
@@ -49,16 +49,15 @@ interface ItemSummary {
 interface SlimItem {
   itemId: string;
   title: string;
-  categories?: Array<{ categoryId: string; categoryName: string }>;
-  price?: { value: string; currency: string };
-  currentBidPrice?: { value: string; currency: string };
+  category?: string;
+  price?: number;
+  bidPrice?: number;
+  shipping?: number;
   condition?: string;
-  buyingOptions?: string[];
+  format?: string;
   bidCount?: number;
-  itemEndDate?: string;
-  shippingCost?: { value: string; currency: string };
+  endDate?: string;
   seller?: string;
-  itemWebUrl?: string;
   location?: string;
 }
 
@@ -68,25 +67,31 @@ function slimItem(item: ItemSummary): SlimItem {
     ? `${seller.username} (${seller.feedbackPercentage ?? '?'}%, ${seller.feedbackScore ?? '?'})`
     : undefined;
 
-  const shipping = item.shippingOptions?.[0]?.shippingCost;
+  const shippingVal = parseFloat(item.shippingOptions?.[0]?.shippingCost?.value ?? '');
+  const priceVal = parseFloat(item.price?.value ?? '');
+  const bidPriceVal = parseFloat(item.currentBidPrice?.value ?? '');
 
   const categories = (item as Record<string, unknown>).categories as
     | Array<{ categoryId: string; categoryName: string }>
     | undefined;
+  const primaryCat = categories?.[0];
+  const categoryStr = primaryCat ? `${primaryCat.categoryId} (${primaryCat.categoryName})` : undefined;
+
+  const format = item.buyingOptions?.[0];
+  const isAuction = format === 'AUCTION';
 
   return {
     itemId: item.itemId,
     title: item.title,
-    ...(categories?.length ? { categories } : {}),
-    ...(item.price ? { price: item.price } : {}),
-    ...(item.currentBidPrice ? { currentBidPrice: item.currentBidPrice } : {}),
+    ...(categoryStr ? { category: categoryStr } : {}),
+    ...(!isNaN(priceVal) ? { price: priceVal } : {}),
+    ...(isAuction && !isNaN(bidPriceVal) ? { bidPrice: bidPriceVal } : {}),
+    ...(!isNaN(shippingVal) ? { shipping: shippingVal } : {}),
     ...(item.condition ? { condition: item.condition } : {}),
-    ...(item.buyingOptions ? { buyingOptions: item.buyingOptions } : {}),
-    ...(item.bidCount != null ? { bidCount: item.bidCount } : {}),
-    ...(item.itemEndDate ? { itemEndDate: item.itemEndDate } : {}),
-    ...(shipping ? { shippingCost: shipping } : {}),
+    ...(format ? { format } : {}),
+    ...(isAuction && item.bidCount != null ? { bidCount: item.bidCount } : {}),
+    ...(isAuction && item.itemEndDate ? { endDate: item.itemEndDate } : {}),
     ...(sellerStr ? { seller: sellerStr } : {}),
-    ...(item.itemWebUrl ? { itemWebUrl: item.itemWebUrl } : {}),
     ...(item.itemLocation?.country ? { location: item.itemLocation.country } : {}),
   };
 }
@@ -114,6 +119,7 @@ async function searchByFormat(
     filter?: string;
     sort?: string;
     limit: number;
+    offset?: number;
     marketplace: string;
   },
 ): Promise<FormatResult> {
@@ -126,6 +132,7 @@ async function searchByFormat(
 
   if (opts.category_ids) params.set('category_ids', opts.category_ids);
   if (opts.sort) params.set('sort', opts.sort);
+  if (opts.offset) params.set('offset', String(opts.offset));
 
   const url = `${BROWSE_API_BASE}?${params.toString()}`;
 
@@ -188,23 +195,26 @@ server.tool(
     filter: z.string().optional().describe('Additional Browse API filters (e.g. "price:[50..200],priceCurrency:GBP,conditions:{USED}")'),
     sort: z.string().optional().describe('Sort order: newlyListed, price, -price, endingSoonest (default: newlyListed)'),
     limit: z.number().optional().describe(`Max results per buying format (default ${DEFAULT_LIMIT}, max ${MAX_LIMIT}). Total results can be up to 3x this.`),
+    page: z.number().min(1).default(1).describe('Page number for pagination (each page returns limit results per format)'),
     marketplace: z.string().optional().describe(`eBay marketplace ID (default: ${DEFAULT_MARKETPLACE}). Examples: EBAY_GB, EBAY_US, EBAY_DE`),
   },
-  async ({ q, category_ids, filter, sort, limit, marketplace }) => {
+  async ({ q, category_ids, filter, sort, limit, page, marketplace }) => {
     if (!ACCESS_TOKEN) {
       return errorResult('EBAY_ACCESS_TOKEN not set. Cannot authenticate with Browse API.');
     }
 
     const effectiveLimit = Math.min(limit || DEFAULT_LIMIT, MAX_LIMIT);
     const effectiveMarketplace = marketplace || DEFAULT_MARKETPLACE;
+    const offset = (page - 1) * effectiveLimit;
 
-    log(`search_ebay: "${q}" (limit=${effectiveLimit}, marketplace=${effectiveMarketplace})`);
+    log(`search_ebay: "${q}" (limit=${effectiveLimit}, page=${page}, marketplace=${effectiveMarketplace})`);
 
     const opts = {
       category_ids,
       filter,
       sort,
       limit: effectiveLimit,
+      offset: offset > 0 ? offset : undefined,
       marketplace: effectiveMarketplace,
     };
 
@@ -237,6 +247,7 @@ server.tool(
     }
 
     const items = deduplicateAndSlim(succeeded);
+    const hasMore = succeeded.some((r) => r.total > (offset || 0) + effectiveLimit);
 
     return jsonResult({
       total: items.length,
@@ -244,7 +255,10 @@ server.tool(
       meta: {
         query: q,
         marketplace: effectiveMarketplace,
+        currency: 'GBP',
+        page,
         limit_per_format: effectiveLimit,
+        has_more: hasMore,
         formats_searched: succeeded.map((r) => ({ format: r.format, count: r.items.length, api_total: r.total })),
         formats_failed: failed.length > 0 ? failed : undefined,
       },

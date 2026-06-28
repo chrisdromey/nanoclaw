@@ -52,6 +52,101 @@ describe('task scheduler', () => {
     expect(task?.status).toBe('paused');
   });
 
+  it('skips once-tasks missed during downtime instead of replaying them', async () => {
+    createTask({
+      id: 'stale-once',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'stale notification',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      // Due ~2 months ago — well past the 1h grace window
+      next_run: new Date(Date.now() - 60 * 24 * 3_600_000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const enqueueTask = vi.fn();
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask } as any,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Never enqueued for execution...
+    expect(enqueueTask).not.toHaveBeenCalled();
+    // ...and marked completed so it won't fire again
+    expect(getTaskById('stale-once')?.status).toBe('completed');
+  });
+
+  it('rolls stale cron tasks forward without running a catch-up', async () => {
+    createTask({
+      id: 'stale-cron',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'daily review',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60 * 24 * 3_600_000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const enqueueTask = vi.fn();
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask } as any,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const task = getTaskById('stale-cron');
+    // Not run as a catch-up, still active, rolled forward to the future
+    expect(enqueueTask).not.toHaveBeenCalled();
+    expect(task?.status).toBe('active');
+    expect(new Date(task!.next_run!).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('still runs tasks that are only briefly overdue (within grace)', async () => {
+    createTask({
+      id: 'fresh-once',
+      group_folder: 'test',
+      chat_jid: 'test@g.us',
+      prompt: 'recent task',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 60_000).toISOString(), // 1 min ago
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const enqueueTask = vi.fn();
+
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask } as any,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(enqueueTask).toHaveBeenCalledTimes(1);
+  });
+
   it('computeNextRun anchors interval tasks to scheduled time to prevent drift', () => {
     const scheduledTime = new Date(Date.now() - 2000).toISOString(); // 2s ago
     const task = {
