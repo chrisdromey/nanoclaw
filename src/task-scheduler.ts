@@ -127,28 +127,41 @@ export function shouldSkipDealHunterTask(task: ScheduledTask): string | null {
 
   let db: InstanceType<typeof Database> | undefined;
   try {
-    const dbPath = path.join(resolveGroupFolderPath(task.group_folder), 'deal-hunter.db');
+    const dbPath = path.join(
+      resolveGroupFolderPath(task.group_folder),
+      'deal-hunter.db',
+    );
     db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
     if (huntIds.size > 0) {
-      const stmt = db.prepare('SELECT status, monitoring FROM hunts WHERE id = ?');
+      const stmt = db.prepare(
+        'SELECT status, monitoring FROM hunts WHERE id = ?',
+      );
       const states: string[] = [];
       for (const id of huntIds) {
-        const hunt = stmt.get(id) as { status: string; monitoring: number } | undefined;
-        if (hunt && hunt.status === 'active' && hunt.monitoring === 1) return null;
+        const hunt = stmt.get(id) as
+          | { status: string; monitoring: number }
+          | undefined;
+        if (hunt && hunt.status === 'active' && hunt.monitoring === 1)
+          return null;
         states.push(`hunt ${id}: ${hunt ? hunt.status : 'not found'}`);
       }
       return `no referenced hunt is active+monitored (${states.join(', ')})`;
     }
 
     const active = db
-      .prepare("SELECT COUNT(*) as count FROM hunts WHERE status = 'active' AND monitoring = 1")
+      .prepare(
+        "SELECT COUNT(*) as count FROM hunts WHERE status = 'active' AND monitoring = 1",
+      )
       .get() as { count: number };
     if (active.count === 0) return 'no active monitored hunts';
     return null;
   } catch (err) {
     // Fail open: a missing/unreadable deal-hunter.db must never block a task.
-    logger.debug({ taskId: task.id, err }, 'Deal-hunter gate could not read hunt state; running task');
+    logger.debug(
+      { taskId: task.id, err },
+      'Deal-hunter gate could not read hunt state; running task',
+    );
     return null;
   } finally {
     db?.close();

@@ -61,7 +61,9 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
-const COMPACT_THRESHOLD_TOKENS = parseInt(process.env.COMPACT_THRESHOLD_TOKENS || '150000', 10);
+// 100K (was 150K): long-lived sessions re-write their whole context to cache every turn,
+// so cost grows with context size × turn count — compact earlier to keep the ceiling down.
+const COMPACT_THRESHOLD_TOKENS = parseInt(process.env.COMPACT_THRESHOLD_TOKENS || '100000', 10);
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.

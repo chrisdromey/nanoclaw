@@ -273,14 +273,18 @@ describe('shouldSkipDealHunterTask (hunt pause gate)', () => {
   it('skips a per-hunt task when the referenced hunt is paused', () => {
     seedHuntDb([{ id: 1, status: 'paused', monitoring: 0 }]);
     const reason = shouldSkipDealHunterTask(
-      makeTask('Daily review. Hunt DB ID: 1 (name: proxmox-node-mini-pc). Check hunt_id=1.'),
+      makeTask(
+        'Daily review. Hunt DB ID: 1 (name: proxmox-node-mini-pc). Check hunt_id=1.',
+      ),
     );
     expect(reason).toMatch(/hunt 1: paused/);
   });
 
   it('runs a per-hunt task when the referenced hunt is active and monitored', () => {
     seedHuntDb([{ id: 1, status: 'active', monitoring: 1 }]);
-    const reason = shouldSkipDealHunterTask(makeTask('Daily review. Hunt DB ID: 1.'));
+    const reason = shouldSkipDealHunterTask(
+      makeTask('Daily review. Hunt DB ID: 1.'),
+    );
     expect(reason).toBeNull();
   });
 
@@ -301,7 +305,10 @@ describe('shouldSkipDealHunterTask (hunt pause gate)', () => {
       { id: 2, status: 'closed', monitoring: 0 },
     ]);
     const reason = shouldSkipDealHunterTask(
-      makeTask('Daily review — assess the bigger picture across all active hunts.', 'deal-hunter-daily-review'),
+      makeTask(
+        'Daily review — assess the bigger picture across all active hunts.',
+        'deal-hunter-daily-review',
+      ),
     );
     expect(reason).toBe('no active monitored hunts');
   });
@@ -309,7 +316,10 @@ describe('shouldSkipDealHunterTask (hunt pause gate)', () => {
   it('runs a generic deal-hunter task when a hunt is active', () => {
     seedHuntDb([{ id: 1, status: 'active', monitoring: 1 }]);
     const reason = shouldSkipDealHunterTask(
-      makeTask('Daily review across all active hunts.', 'deal-hunter-daily-review'),
+      makeTask(
+        'Daily review across all active hunts.',
+        'deal-hunter-daily-review',
+      ),
     );
     expect(reason).toBeNull();
   });
