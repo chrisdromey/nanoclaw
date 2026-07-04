@@ -13,7 +13,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import Database from 'better-sqlite3';
-import { evaluateActivationGate, validateCriteriaForVertical, type HuntRow } from './deal-hunter-gate.js';
+import {
+  evaluateActivationGate,
+  validateCriteriaForVertical,
+  enumerateHuntTargetKeys,
+  type HuntRow,
+} from './deal-hunter-gate.js';
 
 // --- DB Initialization ---
 // Schema is owned by the watcher service. This MCP server only reads/writes.
@@ -57,6 +62,30 @@ function huntGateVersion(huntId: number): number {
   } catch {
     return 1;
   }
+}
+
+// Validate a `target_key` argument against the hunt's enumerated criteria target keys — the SAME
+// enumeration the activation gate anchors on (enumerateHuntTargetKeys, from the gate module). This
+// blocks alias rows (e.g. target_key "EV6" when the criteria key is "Kia EV6"): the gate matches
+// target keys as exact strings, so an alias KB/verification row satisfies nothing it checks yet can
+// make segments look anchored. Returns an error message (write must be refused) or null when valid.
+function validateTargetKeyForHunt(huntId: number, targetKey: string): string | null {
+  const res = enumerateHuntTargetKeys(db, huntId);
+  if (!res.ok) return `Cannot validate target_key: ${res.reason}`;
+  if (res.keys.length === 0) {
+    // Experimental fallback: a hunt whose criteria declare no target keys is gated under the
+    // synthetic "_hunt" key — that is the only acceptable target_key for it.
+    return targetKey === '_hunt'
+      ? null
+      : `Invalid target_key "${targetKey}": hunt ${huntId}'s criteria declare no target keys, so the only valid target_key is "_hunt". Pass target_key "_hunt" verbatim.`;
+  }
+  if (res.keys.includes(targetKey)) return null;
+  return (
+    `Invalid target_key "${targetKey}" for hunt ${huntId}. The activation gate matches target keys ` +
+    `exactly, so this row would never satisfy it. Valid target keys for this hunt are: ` +
+    `${res.keys.map((k) => `"${k}"`).join(', ')}. Pass one of these verbatim (the full criteria key, ` +
+    `e.g. "Kia EV6" — not a shortened alias like "EV6").`
+  );
 }
 
 // p25 / median / p75 of a numeric sample (linear interpolation), or null for an empty sample.
@@ -1229,7 +1258,7 @@ server.tool(
     hunt_id: z.number(),
     name: z.string().describe('Short descriptive name for this grouping — also used for offer matching, so include the product name/model'),
     description: z.string().optional().describe('What defines this segment'),
-    tags: z.string().optional().describe('JSON array of tags used to match offers to this segment. Include the product model (e.g. "5650G") AND attribute tags (e.g. "ECC-confirmed", "ATX"). Reuse tags from existing segments for consistency — check all_hunt_segments in the response.'),
+    tags: z.string().optional().describe('JSON array of tags used to match offers to this segment. Include the product model (e.g. "5650G") AND attribute tags (e.g. "ECC-confirmed", "ATX"). For feature-led hunts the exact criteria target key must be included verbatim as one of the tags (e.g. "Kia EV6", not just "EV6") — the activation gate anchors segments to researched targets via tags. Reuse tags from existing segments for consistency — check all_hunt_segments in the response.'),
     filter_patterns: z.string().optional().describe('JSON object of title patterns, condition filters, price hints for future auto-classification'),
     price_low: z.number().optional().describe('DEPRECATED for v2 hunts — price bands are DERIVED from recorded comps. Record comps via record_baseline_price then call recompute_segment_prices. (Legacy v1 hunts: good-deal threshold.)'),
     price_mid: z.number().optional().describe('DEPRECATED for v2 hunts (derived). Legacy v1: typical/fair market price.'),
@@ -1598,6 +1627,8 @@ server.tool(
   async (args) => {
     const hunt = db.prepare('SELECT id, vertical FROM hunts WHERE id = ?').get(args.hunt_id) as { id: number; vertical: string } | undefined;
     if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+    const targetKeyError = validateTargetKeyForHunt(args.hunt_id, args.target_key);
+    if (targetKeyError) return errorResult(targetKeyError);
     const totalCitations =
       args.citation_count ?? Object.values(args.must_have_citations).reduce((a, b) => a + (b || 0), 0);
     db.prepare(
@@ -1629,6 +1660,8 @@ server.tool(
   async (args) => {
     const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
     if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+    const targetKeyError = validateTargetKeyForHunt(args.hunt_id, args.target_key);
+    if (targetKeyError) return errorResult(targetKeyError);
     db.prepare(
       `INSERT INTO claim_verifications (hunt_id, target_key, feature, verdict, evidence_url, notes, checked_at)
        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
@@ -1655,6 +1688,8 @@ server.tool(
   async (args) => {
     const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
     if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+    const targetKeyError = validateTargetKeyForHunt(args.hunt_id, args.target_key);
+    if (targetKeyError) return errorResult(targetKeyError);
     db.prepare(
       `INSERT INTO claim_verifications (hunt_id, target_key, feature, verdict, evidence_url, notes, checked_at)
        VALUES (?, ?, ?, 'verified', NULL, ?, datetime('now'))

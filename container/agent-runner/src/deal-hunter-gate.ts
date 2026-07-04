@@ -365,6 +365,42 @@ function enumerateTargetKeys(
   return [...keys];
 }
 
+// Enumerate a hunt's valid target keys by loading its criteria and its vertical's criteria_schema
+// from the DB — the SAME enumeration the provenance gate anchors on. Exported so the MCP tools that
+// take a `target_key` argument (record_kb_coverage, record_claim_verification, waive_must_have) can
+// reject keys the gate would never check (e.g. alias "EV6" for the real key "Kia EV6"), which would
+// otherwise create unanchored KB/verification rows that quietly satisfy nothing — or worse, let a
+// segment anchor to an alias. Fails closed (ok:false) when the vertical config is unavailable or the
+// criteria are not valid JSON. An empty `keys` array means the hunt declares no wildcard-map target
+// keys — callers should then accept only the gate's "_hunt" experimental fallback key.
+export function enumerateHuntTargetKeys(
+  db: Database.Database,
+  huntId: number,
+): { ok: true; keys: string[] } | { ok: false; reason: string } {
+  let row: { criteria: string | null; vertical: string | null } | undefined;
+  try {
+    row = db.prepare('SELECT criteria, vertical FROM hunts WHERE id = ?').get(huntId) as
+      | { criteria: string | null; vertical: string | null }
+      | undefined;
+  } catch {
+    return { ok: false, reason: `cannot read hunt ${huntId} from the hunts table` };
+  }
+  if (!row) return { ok: false, reason: `hunt ${huntId} not found` };
+  const cfg = getVerticalConfig(db, row.vertical || 'computers');
+  if (!cfg.ok) return { ok: false, reason: cfg.reason };
+  let criteria: unknown = {};
+  try {
+    criteria = JSON.parse(row.criteria || '{}');
+  } catch {
+    return { ok: false, reason: `hunt ${huntId} criteria is not valid JSON` };
+  }
+  if (!criteria || typeof criteria !== 'object' || Array.isArray(criteria)) {
+    return { ok: true, keys: [] };
+  }
+  const schema = (cfg.config.criteria_schema ?? {}) as Record<string, unknown>;
+  return { ok: true, keys: enumerateTargetKeys(schema, criteria as Record<string, unknown>) };
+}
+
 interface SegmentRow {
   id: number;
   name: string;
@@ -452,17 +488,36 @@ function checkProvenanceGate(
           );
         }
       }
-      // KB-anchor: a feature-led segment must map to a researched target (its name references a
-      // KB-covered target), so buckets come from the spec research, not invented. Skipped until at
-      // least one KB row exists (the C check reports the missing KB instead).
+      // KB-anchor: a feature-led segment must map to a researched target, so buckets come from the
+      // spec research, not invented. Tags are the operative linkage — they are the offer-matching
+      // vocabulary, so a KB-covered target key carried as a tag (exact, case-insensitive) is what
+      // ties the segment to its researched target; a target key appearing in the segment NAME
+      // (case-insensitive substring) also anchors, since researchers often lead names with the
+      // target. Skipped until at least one KB row exists (the C check reports the missing KB
+      // instead).
       if (coveredTargets.size > 0) {
         const segName = seg.name.toLowerCase();
-        const anchored = [...coveredTargets].some((tk) => segName.includes(tk.toLowerCase()));
+        let segTags: string[] = [];
+        try {
+          const parsedTags = JSON.parse(seg.tags || '[]');
+          if (Array.isArray(parsedTags)) {
+            segTags = parsedTags
+              .filter((t): t is string => typeof t === 'string')
+              .map((t) => t.trim().toLowerCase());
+          }
+        } catch {
+          // invalid tags JSON → treat as no tags; the name check below still applies
+        }
+        const anchored = [...coveredTargets].some((tk) => {
+          const key = tk.toLowerCase();
+          return segName.includes(key) || segTags.includes(key);
+        });
         if (!anchored) {
           errors.push(
             `segment "${seg.name}" does not map to any researched target (${[...coveredTargets]
               .map((t) => `"${t}"`)
-              .join(', ')}) — name segments after a KB-covered trim/target.`,
+              .join(', ')}) — the segment's name or tags must reference a KB-covered target ` +
+              `(include the exact target key verbatim as a tag).`,
           );
         }
       }

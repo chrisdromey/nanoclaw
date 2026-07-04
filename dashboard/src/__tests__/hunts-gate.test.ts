@@ -439,6 +439,48 @@ describe('provenance gate (gate_version >= 2) — B/C/D', () => {
     expect(gate()).toEqual({ ok: true, errors: [] });
   });
 
+  it('KB-anchor: a segment whose TAGS carry the target key passes even when its name does not', () => {
+    insertV2Hunt();
+    // Name has no trace of "Polestar 2" — but the exact target key is in the tags.
+    const seg = addSeg('Long Range Single Motor (2022-23)', ['polestar 2', 'long range', '78kWh']);
+    addComp(seg, 24000, 1); addComp(seg, 25000, 2); addComp(seg, 26000, 3);
+    addKb();
+    addVerdict('verified');
+    expect(gate()).toEqual({ ok: true, errors: [] });
+  });
+
+  it('KB-anchor: tag matching is exact per-element, not substring-of-concatenation', () => {
+    insertV2Hunt();
+    // No single tag equals "Polestar 2" (and the name does not contain it) → not anchored.
+    const seg = addSeg('Long Range Single Motor (2022-23)', ['polestar', '2', 'long range']);
+    addComp(seg, 24000, 1); addComp(seg, 25000, 2); addComp(seg, 26000, 3);
+    addKb();
+    addVerdict('verified');
+    expect(gate().errors.some((e) => e.includes('does not map to any researched target'))).toBe(true);
+  });
+
+  it('KB-anchor: a segment with neither an anchoring name nor an anchoring tag fails', () => {
+    insertV2Hunt();
+    const seg = addSeg('Long Range Single Motor (2022-23)', ['long range', '78kWh']);
+    addComp(seg, 24000, 1); addComp(seg, 25000, 2); addComp(seg, 26000, 3);
+    addKb();
+    addVerdict('verified');
+    expect(
+      gate().errors.some((e) => e.includes('does not map to any researched target') && e.includes('Long Range Single Motor')),
+    ).toBe(true);
+  });
+
+  it('KB-anchor: invalid tags JSON is treated as no tags — an anchored NAME still passes', () => {
+    insertV2Hunt();
+    const seg = pdb
+      .prepare("INSERT INTO market_segments (hunt_id, name, tags) VALUES (1, 'Polestar 2 LR', '{not json')")
+      .run().lastInsertRowid as number;
+    addComp(seg, 24000, 1); addComp(seg, 25000, 2); addComp(seg, 26000, 3);
+    addKb();
+    addVerdict('verified');
+    expect(gate()).toEqual({ ok: true, errors: [] });
+  });
+
   it('B: blocks a segment with fewer than 3 sourced+tagged comps', () => {
     insertV2Hunt();
     const seg = addSeg('Polestar 2 LR');

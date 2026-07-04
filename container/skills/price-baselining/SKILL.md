@@ -70,9 +70,11 @@ This is the authoritative source for price tiers — the dashboard and evaluatio
 **read the knowledge base first** and define one segment per trim/variant the KB describes, so your
 buckets come from the spec research, not guesswork. Call `create_market_segment`:
 - `hunt_id`, and `name` — short, including the product/model **and trim** (e.g. "Leaf N-Connecta",
-  "Polestar 2 Long Range (2021-22)"). Name segments after a KB-covered trim/target. Reuse the **same
-  name** when re-researching to update rather than duplicate.
-- `tags` — JSON array used to match offers: include the model name **and** trim/attribute tags. Check
+  "Polestar 2 Long Range (2021-22)"). Preferably start the name with the KB-covered target key.
+  Reuse the **same name** when re-researching to update rather than duplicate.
+- `tags` — JSON array used to match offers: include the model name **and** trim/attribute tags. The
+  tags **MUST include the exact `criteria.targets` key verbatim** (e.g. `"Kia EV6"`, not just
+  `"EV6"`) — the activation gate anchors each segment to a researched target through its tags. Check
   `all_hunt_segments` in the response and reuse existing tags exactly.
 - `notes` — qualitative caveats (don't put feature *claims* here; those belong in the KB).
 - (Don't bother with `price_low/mid/high`/`sample_size`/`confidence` — derived for v2.)
