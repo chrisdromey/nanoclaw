@@ -348,25 +348,45 @@ server.tool(
 // ============================================================
 server.tool(
   'get_hunt_summary',
-  'Comprehensive session startup summary for a hunt. Pass `since` (ISO timestamp) to filter to changes after that time — useful for event-driven and daily review runs. Omit for full summary.',
+  'Orientation summary for a hunt: hunt config, offer counts, watched-offer headlines, recent price/status changes, market segments, and health warnings. Slim by design (progressive disclosure): watched offers exclude bulky attributes/specs — call get_offer(offer_id) for full detail on one offer; oversized criteria is truncated — call get_hunt(hunt_id) for the full config. Pass `since` (ISO timestamp) to filter to changes after that time — useful for event-driven and daily review runs. Omit for full summary.',
   {
     hunt_id: z.number(),
     since: z.string().optional().describe('ISO timestamp — only return changes after this time. Omit for full summary.'),
   },
   async ({ hunt_id, since }) => {
-    const hunt = db.prepare('SELECT * FROM hunts WHERE id = ?').get(hunt_id);
+    // Explicit columns, not SELECT * — this tool is an orientation summary, and hunt rows can
+    // carry multi-KB criteria/search_terms JSON. Oversized criteria is truncated with a pointer
+    // to get_hunt (never hidden, just deferred).
+    const hunt = db.prepare(`
+      SELECT id, name, status, monitoring, vertical, sources, criteria, search_terms,
+        cadence_minutes, poll_interval_minutes, category_ids, gate_version,
+        created_at, last_reviewed_at
+      FROM hunts WHERE id = ?
+    `).get(hunt_id) as any;
     if (!hunt) return errorResult('Hunt not found: ' + hunt_id);
+
+    const CRITERIA_CAP_CHARS = 4096;
+    if (typeof hunt.criteria === 'string' && hunt.criteria.length > CRITERIA_CAP_CHARS) {
+      hunt.criteria = hunt.criteria.slice(0, CRITERIA_CAP_CHARS);
+      hunt.criteria_truncated = `criteria truncated at ${CRITERIA_CAP_CHARS} chars — call get_hunt(${hunt_id}) for the full criteria`;
+    }
 
     const newOffers = since
       ? db.prepare(`SELECT COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? AND status = 'new' AND first_associated_at > ?`).get(hunt_id, since) as any
       : db.prepare(`SELECT COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? AND status = 'new'`).get(hunt_id) as any;
 
+    // Headline columns only — attributes/specs_extracted are the payload-bloat fields
+    // (multi-KB JSON per offer). Full detail per offer stays one call away via get_offer.
     const watchedOffers = db.prepare(`
-      SELECT o.*, ho.status as hunt_offer_status,
+      SELECT o.id, o.title, o.source, o.source_id, o.url, o.status, o.condition,
+        o.buying_format, o.auction_end_time, o.bid_count, o.watch_conditions,
+        ho.status as hunt_offer_status,
         (SELECT p.total_landed_gbp FROM prices p WHERE p.offer_id = o.id ORDER BY p.observed_at DESC LIMIT 1) as latest_price_gbp
       FROM offers o
       JOIN hunt_offers ho ON ho.offer_id = o.id
       WHERE ho.hunt_id = ? AND o.watching = 1
+      ORDER BY o.auction_end_time IS NULL, o.auction_end_time ASC
+      LIMIT 20
     `).all(hunt_id);
 
     const priceTimeFilter = since ? '?' : "datetime('now', '-7 days')";
@@ -459,6 +479,7 @@ server.tool(
       hunt,
       new_offer_count: (newOffers as any).count,
       watched_offers: watchedOffers,
+      watched_offers_note: 'headline fields only (max 20, soonest-ending first) — call get_offer(offer_id) for full detail incl. attributes/specs',
       recent_price_changes: recentPriceChanges,
       status_changes: statusChanges,
       recent_searches: recentSearches,
