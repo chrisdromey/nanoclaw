@@ -19,7 +19,7 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { buildEvaluatorAgents } from './vertical-agents.js';
-import { createManageHuntGateHook, createDraftGuardStopHook } from './deal-hunter-hooks.js';
+import { createManageHuntGateHook, createDraftGuardStopHook, createTriageDelegationGateHook } from './deal-hunter-hooks.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -675,7 +675,14 @@ Key rules:
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
         // Deal Hunter activation gate (behavioural): deny premature activate/resume early, and
         // block finishing a session that left a freshly-created hunt as an un-baselined draft.
-        PreToolUse: [{ matcher: 'mcp__deal-hunter-db__manage_hunt', hooks: [createManageHuntGateHook()] }],
+        PreToolUse: [
+          { matcher: 'mcp__deal-hunter-db__manage_hunt', hooks: [createManageHuntGateHook()] },
+          // HARD delegation enforcement: allowedTools does NOT restrict availability under
+          // bypassPermissions (it only controls auto-approval), so this hook is what actually
+          // blocks batch-triage tools on the main thread. Sub-agent calls pass through
+          // (BaseHookInput.agent_id present). No matcher — the hook filters by tool name.
+          { hooks: [createTriageDelegationGateHook()] },
+        ],
         Stop: [{ hooks: [createDraftGuardStopHook()] }],
       },
     }

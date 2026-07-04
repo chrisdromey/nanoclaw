@@ -55,13 +55,24 @@ export const DAILY_API_BUDGET = 4500;             // Stop at 4500 (limit is 5000
 export const SEARCH_LIMIT_PER_FORMAT = 50;
 
 // New-offer triage queue management (token-burn protection).
-// Queued (hunt_offers.status='new') offers older than this are auto-dismissed as stale —
-// after a long watcher outage the backlog is mostly dead listings, and triaging weeks of
-// history in one agent run is the single biggest token sink we've observed.
-export const STALE_QUEUE_DAYS = intFromEnv('STALE_QUEUE_DAYS', 7);
+// All values are clamped to sane minimums — a zero/negative env override would otherwise
+// silently disable notifications (cap=0) or flush the whole queue every sweep (days=0).
+//
+// Queued (hunt_offers.status='new') offers of ACTIVE monitored hunts older than this are
+// auto-dismissed as stale — after a long watcher outage the backlog is mostly dead
+// listings, and triaging weeks of history in one agent run is the single biggest token
+// sink we've observed. Paused/draft hunts' queues are frozen, not flushed.
+export const STALE_QUEUE_DAYS = Math.max(1, intFromEnv('STALE_QUEUE_DAYS', 7));
 // Hard cap on how many queued offers a single agent triage run is asked to evaluate,
 // summed across all hunts in one notification. The remainder stays status='new' and
 // drains on subsequent ticks.
-export const MAX_TRIAGE_BATCH_PER_RUN = intFromEnv('MAX_TRIAGE_BATCH_PER_RUN', 40);
+export const MAX_TRIAGE_BATCH_PER_RUN = Math.max(1, intFromEnv('MAX_TRIAGE_BATCH_PER_RUN', 40));
 // How often to check for (and announce) a leftover backlog when no fresh offers arrived.
-export const TRIAGE_DRAIN_CADENCE_MS = intFromEnv('TRIAGE_DRAIN_CADENCE_MINUTES', 30) * 60_000;
+export const TRIAGE_DRAIN_CADENCE_MS = Math.max(60_000, intFromEnv('TRIAGE_DRAIN_CADENCE_MINUTES', 30) * 60_000);
+// Don't re-announce a hunt whose pending queue hasn't changed since its last announcement
+// until this much time has passed — a sub-agent that fails to triage a batch must not be
+// re-spawned every drain tick (that would be a token leak of its own).
+export const TRIAGE_REANNOUNCE_BACKOFF_MS = Math.max(
+  60_000,
+  intFromEnv('TRIAGE_REANNOUNCE_BACKOFF_MINUTES', 240) * 60_000,
+);

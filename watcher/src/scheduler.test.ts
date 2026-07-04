@@ -46,6 +46,7 @@ vi.mock('./config.js', () => ({
   STALE_QUEUE_DAYS: 7,
   MAX_TRIAGE_BATCH_PER_RUN: 40,
   TRIAGE_DRAIN_CADENCE_MS: 1_800_000,
+  TRIAGE_REANNOUNCE_BACKOFF_MS: 14_400_000,
   EBAY_CLIENT_ID: 'id',
   EBAY_CLIENT_SECRET: 'secret',
   AUCTION_THRESHOLDS: [24, 12, 6],
@@ -172,6 +173,7 @@ function makeState(): SchedulerState {
     // Defaults keep drain/flush inert for dispatch tests; triage tests override.
     lastDrainTime: Date.now(),
     lastQueueFlushTime: Date.now(),
+    lastAnnounced: new Map(),
   };
 }
 
@@ -816,6 +818,67 @@ describe('Triage queue management (backlog cap / stale flush / drain)', () => {
     expect(summaries[0].newCount).toBe(10);
     expect(summaries[0].pendingCount).toBe(10);
     expect(state.lastDrainTime).toBeGreaterThan(0);
+  });
+
+  it('freezes a paused hunt\'s queue — stale flush only touches active hunts', async () => {
+    const huntId = seedHunt();
+    db.prepare("UPDATE hunts SET status = 'paused', monitoring = 0 WHERE id = ?").run(huntId);
+    seedQueuedOffer(huntId, 'frozen-1', 30); // way past STALE_QUEUE_DAYS
+    idleAdapter();
+
+    const state = makeState();
+    state.lastQueueFlushTime = 0;
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+
+    const row = db
+      .prepare("SELECT ho.status FROM hunt_offers ho JOIN offers o ON o.id = ho.offer_id WHERE o.source_id = 'frozen-1'")
+      .get() as { status: string };
+    expect(row.status).toBe('new'); // frozen, not dismissed
+    expect(mockSendNewOffers).not.toHaveBeenCalled(); // paused hunts are never announced
+  });
+
+  it('allocates the batch budget to the hunt with the oldest queue first', async () => {
+    const huntA = seedHunt(); // id 1 — newer queue
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
+      VALUES ('Old Backlog Hunt', '["ev"]', 0, '["ebay"]', 'computers')
+    `).run();
+    const huntB = (db.prepare("SELECT id FROM hunts WHERE name = 'Old Backlog Hunt'").get() as { id: number }).id;
+    for (let i = 0; i < 38; i++) seedQueuedOffer(huntA, `a|${i}`, 1);
+    for (let i = 0; i < 5; i++) seedQueuedOffer(huntB, `b|${i}`, 3); // older queue
+    idleAdapter();
+
+    const state = makeState();
+    state.lastDrainTime = 0;
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+
+    const summaries = mockSendNewOffers.mock.calls[0][0];
+    expect(summaries[0].huntId).toBe(huntB); // oldest queue served first
+    expect(summaries[0].newCount).toBe(5);
+    expect(summaries[1].huntId).toBe(huntA);
+    expect(summaries[1].newCount).toBe(35); // remaining budget of 40
+  });
+
+  it('backs off re-announcing an unchanged queue, re-announces when it changes', async () => {
+    const huntId = seedHunt();
+    for (let i = 0; i < 10; i++) seedQueuedOffer(huntId, `same|${i}`, 1);
+    idleAdapter();
+
+    const state = makeState();
+    state.lastDrainTime = 0;
+    state.lastAnnounced.set(huntId, { pending: 10, at: Date.now() }); // just announced, unchanged
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+    expect(mockSendNewOffers).not.toHaveBeenCalled();
+
+    // Queue changes (one more offer) → re-announce despite recent announcement
+    seedQueuedOffer(huntId, 'same|new', 0);
+    state.lastDrainTime = 0;
+    await tick(state, db);
+    expect(mockSendNewOffers).toHaveBeenCalledTimes(1);
+    expect(mockSendNewOffers.mock.calls[0][0][0].pendingCount).toBe(11);
   });
 
   it('does not drain before the drain cadence elapses', async () => {

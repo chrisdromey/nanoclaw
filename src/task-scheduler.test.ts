@@ -324,6 +324,13 @@ describe('shouldSkipDealHunterTask (hunt pause gate)', () => {
     expect(reason).toBeNull();
   });
 
+  it('never gates once-tasks (user reminders mentioning deal hunter survive)', () => {
+    seedHuntDb([{ id: 1, status: 'paused', monitoring: 0 }]);
+    const task = makeTask('Remind me to resume the Deal Hunter hunts. hunt_id=1', 'reminder-1');
+    task.schedule_type = 'once';
+    expect(shouldSkipDealHunterTask(task)).toBeNull();
+  });
+
   it('fails open when deal-hunter.db is missing', () => {
     fs.mkdirSync(groupDir, { recursive: true }); // group exists, no DB
     const reason = shouldSkipDealHunterTask(makeTask('Hunt DB ID: 1'));

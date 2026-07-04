@@ -117,6 +117,13 @@ function skipStaleTask(task: ScheduledTask, overdueMs: number): void {
  * Returns a human-readable skip reason, or null to run the task.
  */
 export function shouldSkipDealHunterTask(task: ScheduledTask): string | null {
+  // Only gate RECURRING tasks. A skipped 'once' task is marked completed (next_run → null)
+  // and permanently destroyed — that would silently swallow user reminders that merely
+  // mention deal-hunter terms (e.g. "remind me to resume the Deal Hunter hunts"), and the
+  // watcher's own 'once' alert tasks are only created for hunts that were active moments
+  // earlier anyway.
+  if (task.schedule_type === 'once') return null;
+
   const huntIds = new Set<number>();
   for (const re of [/Hunt DB ID:\s*(\d+)/gi, /hunt_id=(\d+)/gi]) {
     for (const m of task.prompt.matchAll(re)) huntIds.add(parseInt(m[1], 10));
@@ -157,10 +164,12 @@ export function shouldSkipDealHunterTask(task: ScheduledTask): string | null {
     if (active.count === 0) return 'no active monitored hunts';
     return null;
   } catch (err) {
-    // Fail open: a missing/unreadable deal-hunter.db must never block a task.
-    logger.debug(
+    // Fail open: a missing/unreadable deal-hunter.db must never block a task. Logged at
+    // warn (not debug) — if the DB is persistently unreadable (e.g. WAL recovery needed
+    // by a readonly connection), the gate is silently inert and paused hunts burn runs.
+    logger.warn(
       { taskId: task.id, err },
-      'Deal-hunter gate could not read hunt state; running task',
+      'Deal-hunter pause gate could not read hunt state; running task (gate inert)',
     );
     return null;
   } finally {

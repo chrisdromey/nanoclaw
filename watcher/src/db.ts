@@ -501,17 +501,41 @@ export function countNewHuntOffers(db: Database.Database, huntId: number): numbe
 }
 
 /**
- * Auto-dismiss queued (status='new') hunt offers older than `days`.
+ * Pending triage queues per ACTIVE monitored hunt, ordered by oldest queued offer first.
+ * Announcement budget is allocated in this order so a noisy hunt can't starve a quiet
+ * hunt's ageing backlog into the stale flush.
+ */
+export function getHuntsWithPendingNew(
+  db: Database.Database,
+): Array<{ hunt_id: number; pending: number; oldest_queued_at: string }> {
+  return db
+    .prepare(
+      `SELECT ho.hunt_id, COUNT(*) as pending, MIN(ho.first_associated_at) as oldest_queued_at
+       FROM hunt_offers ho
+       JOIN hunts h ON h.id = ho.hunt_id
+       WHERE ho.status = 'new' AND h.status = 'active' AND h.monitoring = 1
+       GROUP BY ho.hunt_id
+       ORDER BY oldest_queued_at ASC`,
+    )
+    .all() as Array<{ hunt_id: number; pending: number; oldest_queued_at: string }>;
+}
+
+/**
+ * Auto-dismiss queued (status='new') offers of ACTIVE monitored hunts older than `days`.
  * Token-burn protection: after a long watcher outage the triage backlog is mostly
  * dead listings; dismissing them prevents a single agent run from being asked to
- * evaluate weeks of history. Returns the number of rows dismissed.
+ * evaluate weeks of history. Paused/draft/closed hunts are excluded — their queues are
+ * frozen while dormant (dismissal is irreversible: hunt_offers is INSERT OR IGNORE, so
+ * a dismissed row never returns to 'new'), and flushed on the first tick after resume.
+ * Returns the number of rows dismissed.
  */
 export function dismissStaleHuntOffers(db: Database.Database, days: number): number {
   const result = db
     .prepare(
       `UPDATE hunt_offers SET status = 'dismissed'
        WHERE status = 'new'
-         AND datetime(first_associated_at) < datetime('now', '-' || ? || ' days')`,
+         AND datetime(first_associated_at) < datetime('now', '-' || ? || ' days')
+         AND hunt_id IN (SELECT id FROM hunts WHERE status = 'active' AND monitoring = 1)`,
     )
     .run(days);
   return result.changes;

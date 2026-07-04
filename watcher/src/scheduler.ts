@@ -20,6 +20,7 @@ import {
   STALE_QUEUE_DAYS,
   MAX_TRIAGE_BATCH_PER_RUN,
   TRIAGE_DRAIN_CADENCE_MS,
+  TRIAGE_REANNOUNCE_BACKOFF_MS,
 } from './config.js';
 import { getAdapter, hasAdapter } from './sources/index.js';
 import { isAuthError, invalidateToken } from './sources/ebay/auth.js';
@@ -29,7 +30,7 @@ import {
   getActiveHunts,
   getWatchedOffers,
   getStaleOffers,
-  countNewHuntOffers,
+  getHuntsWithPendingNew,
   dismissStaleHuntOffers,
   getLastSearchTime,
   getHunt,
@@ -95,6 +96,12 @@ export interface SchedulerState {
   lastDrainTime: number;
   /** Last time the stale-queue flush ran (dismisses status='new' rows older than STALE_QUEUE_DAYS). */
   lastQueueFlushTime: number;
+  /**
+   * Per-hunt record of the last triage announcement (pending count + timestamp).
+   * Drives the re-announce backoff: an unchanged queue is not re-announced until
+   * TRIAGE_REANNOUNCE_BACKOFF_MS elapses.
+   */
+  lastAnnounced: Map<number, { pending: number; at: number }>;
 }
 
 function nextMidnight(): number {
@@ -123,6 +130,7 @@ export function initState(db: Database.Database): SchedulerState {
     sourcePausedAt: new Map(),
     lastDrainTime: Date.now(), // defer first drain — fresh-offer flow handles the first batch
     lastQueueFlushTime: 0,     // flush stale queue on the first tick (covers restart-after-gap)
+    lastAnnounced: new Map(),
   };
 
   const hunts = getActiveHunts(db);
@@ -453,61 +461,54 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
   }
 
   // Send batched new-offer notification (one per tick, not per search term).
-  // Capped at MAX_TRIAGE_BATCH_PER_RUN offers summed across hunts: a single agent
-  // triage run is never asked to evaluate more. The remainder stays
-  // hunt_offers.status='new' and is announced by the drain below on later ticks.
-  if (newOffersByHunt.size > 0) {
+  //
+  // One unified path for fresh finds and backlog drain:
+  // - Budget: at most MAX_TRIAGE_BATCH_PER_RUN offers summed across hunts per notification;
+  //   the remainder stays hunt_offers.status='new' and drains on later ticks.
+  // - Fairness: budget is allocated oldest-queued-hunt-first (getHuntsWithPendingNew), so a
+  //   noisy hunt can't starve a quiet hunt's ageing backlog into the stale flush.
+  // - Backoff: a hunt with no fresh finds whose pending count is unchanged since its last
+  //   announcement is not re-announced until TRIAGE_REANNOUNCE_BACKOFF_MS passes — a
+  //   sub-agent that failed to triage a batch must not be re-spawned every drain tick.
+  const drainDue = Date.now() - state.lastDrainTime >= TRIAGE_DRAIN_CADENCE_MS;
+  if (newOffersByHunt.size > 0 || drainDue) {
+    const pendingHunts = getHuntsWithPendingNew(db);
     const summaries: Parameters<typeof sendNewOffersNotification>[0] = [];
     let budget = MAX_TRIAGE_BATCH_PER_RUN;
-    for (const [huntId, { huntName, vertical, newListings }] of newOffersByHunt.entries()) {
+    for (const { hunt_id, pending } of pendingHunts) {
       if (budget <= 0) {
-        logger.info({ huntId, cap: MAX_TRIAGE_BATCH_PER_RUN }, 'Triage batch cap reached — remaining hunts will drain on later ticks');
+        logger.info(
+          { huntId: hunt_id, cap: MAX_TRIAGE_BATCH_PER_RUN },
+          'Triage batch cap reached — remaining hunts will drain on later ticks',
+        );
         break;
       }
-      // Pending includes any backlog left from earlier capped runs, not just this tick's finds.
-      const pending = countNewHuntOffers(db, huntId);
-      if (pending === 0) continue;
+      const fresh = newOffersByHunt.get(hunt_id);
+      const last = state.lastAnnounced.get(hunt_id);
+      if (!fresh && last && last.pending === pending && Date.now() - last.at < TRIAGE_REANNOUNCE_BACKOFF_MS) {
+        continue; // unchanged queue, recently announced — back off
+      }
+      const hunt = hunts.find((h) => h.id === hunt_id);
+      if (!hunt) continue; // defensive: getHuntsWithPendingNew already filters to active
       const announce = Math.min(pending, budget);
       budget -= announce;
       summaries.push({
-        huntId,
-        huntName,
-        vertical,
-        newCount: announce,
-        pendingCount: pending,
-        newListings: newListings.slice(0, announce),
-        hasBaseline: getSegmentCount(db, huntId) > 0,
-      });
-    }
-    if (summaries.length > 0) {
-      sendNewOffersNotification(summaries);
-      state.lastDrainTime = Date.now();
-    }
-  } else if (Date.now() - state.lastDrainTime >= TRIAGE_DRAIN_CADENCE_MS) {
-    // --- Backlog drain ---
-    // No fresh offers this tick, but earlier capped batches may have left queued
-    // status='new' offers. Announce them in capped batches until the queue empties.
-    const summaries: Parameters<typeof sendNewOffersNotification>[0] = [];
-    let budget = MAX_TRIAGE_BATCH_PER_RUN;
-    for (const hunt of hunts) {
-      if (budget <= 0) break;
-      const pending = countNewHuntOffers(db, hunt.id);
-      if (pending === 0) continue;
-      const announce = Math.min(pending, budget);
-      budget -= announce;
-      summaries.push({
-        huntId: hunt.id,
+        huntId: hunt_id,
         huntName: hunt.name,
         vertical: hunt.vertical,
         newCount: announce,
         pendingCount: pending,
-        hasBaseline: getSegmentCount(db, hunt.id) > 0,
+        // Previews are a sample from this tick's finds — the sub-agent selects the actual
+        // batch via list_offers(order=queued_oldest_first).
+        newListings: fresh ? fresh.newListings.slice(0, announce) : undefined,
+        hasBaseline: getSegmentCount(db, hunt_id) > 0,
       });
+      state.lastAnnounced.set(hunt_id, { pending, at: Date.now() });
     }
     if (summaries.length > 0) {
       logger.info(
-        { hunts: summaries.length, announced: MAX_TRIAGE_BATCH_PER_RUN - budget },
-        'Draining queued new-offer backlog',
+        { hunts: summaries.length, announced: MAX_TRIAGE_BATCH_PER_RUN - budget, drain: newOffersByHunt.size === 0 },
+        'Announcing new-offer triage batch',
       );
       sendNewOffersNotification(summaries);
     }

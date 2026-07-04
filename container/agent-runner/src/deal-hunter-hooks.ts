@@ -169,3 +169,57 @@ export function createDraftGuardStopHook(): HookCallback {
     }
   };
 }
+
+// ============================================================
+// Triage delegation gate
+// ============================================================
+
+/**
+ * Batch-triage tools that must only run inside evaluator sub-agents, never in the
+ * orchestrator's long-lived main context (inline triage was the dominant token sink
+ * in the Jun 2026 burn incident). Single-offer lookups (get_offer, get_offer_history)
+ * stay orchestrator-accessible and are deliberately NOT listed here.
+ */
+const ORCHESTRATOR_FORBIDDEN_TOOLS = new Set([
+  'mcp__deal-hunter-db__get_hunt_summary',
+  'mcp__deal-hunter-db__list_offers',
+  'mcp__deal-hunter-db__record_evaluation',
+  'mcp__deal-hunter-db__batch_dismiss',
+  'mcp__deal-hunter-db__update_offer',
+]);
+const ORCHESTRATOR_FORBIDDEN_PREFIXES = ['mcp__autotrader-search__'];
+
+/**
+ * PreToolUse hook: HARD enforcement of evaluator-sub-agent delegation.
+ *
+ * Why a hook and not the allowedTools list: under permissionMode 'bypassPermissions'
+ * the SDK's allowedTools only controls auto-approval, not availability — every MCP tool
+ * remains callable. This hook is the actual enforcement: it denies the batch-triage
+ * tools on the MAIN thread while letting sub-agents through (BaseHookInput.agent_id is
+ * present only when a hook fires from within a sub-agent).
+ */
+export function createTriageDelegationGateHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    if (pre.hook_event_name !== 'PreToolUse') return {};
+    // Sub-agent call → allowed (that's where triage is supposed to run).
+    if (pre.agent_id) return {};
+    const name = pre.tool_name;
+    const forbidden =
+      ORCHESTRATOR_FORBIDDEN_TOOLS.has(name) ||
+      ORCHESTRATOR_FORBIDDEN_PREFIXES.some((p) => name.startsWith(p));
+    if (!forbidden) return {};
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse' as const,
+        permissionDecision: 'deny' as const,
+        permissionDecisionReason:
+          `${name} is a batch-triage tool and is not available in the main session — offer evaluation must run ` +
+          "inside an evaluator sub-agent so its context is discarded when it returns. Spawn the hunt's evaluator " +
+          '(cars → "cars-evaluator", computers → "deal-evaluator", otherwise "generic-deal-evaluator") via the ' +
+          'Task/Agent tool with the hunt id and offer count, then relay its compact summary. ' +
+          'For a single-offer question use get_offer / get_offer_history instead.',
+      },
+    };
+  };
+}

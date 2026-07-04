@@ -61,8 +61,8 @@ const DELEGATION_RULES = [
   'If a named sub-agent is unavailable, report the failure to the user — do not attempt inline evaluation.',
 ];
 
-function buildUrgentPrompt(huntName: string, changes: Change[], vertical: string): string {
-  const lines: string[] = [`Deal Hunter Watcher Alert — Hunt: "${huntName}"`, ''];
+function buildUrgentPrompt(huntId: number, huntName: string, changes: Change[], vertical: string): string {
+  const lines: string[] = [`Deal Hunter Watcher Alert — Hunt: "${huntName}" (ID ${huntId})`, ''];
 
   for (const change of changes) {
     switch (change.type) {
@@ -88,7 +88,7 @@ function buildUrgentPrompt(huntName: string, changes: Change[], vertical: string
 
   const evaluatorAgent = resolveEvaluatorAgent(vertical);
   lines.push(
-    `Spawn the "${evaluatorAgent}" sub-agent (Task tool) to assess the item(s) above — pass it the hunt name and the source IDs listed, ` +
+    `Spawn the "${evaluatorAgent}" sub-agent (Task tool) to assess the item(s) above — pass it hunt_id=${huntId} and the source IDs listed, ` +
       'and instruct it to review context via get_hunt_summary, evaluate each item, record decisions with record_evaluation, ' +
       'and return a short verdict per item. Relay its verdicts to the user.',
   );
@@ -99,7 +99,7 @@ function buildUrgentPrompt(huntName: string, changes: Change[], vertical: string
 /** Urgent notifications: auction countdown thresholds, watch conditions met. */
 export function sendUrgentNotification(huntId: number, huntName: string, changes: Change[], vertical: string): void {
   const taskId = `watcher-urgent-${Date.now()}-${randomUUID().slice(0, 8)}`;
-  writeIpcTask(taskId, buildUrgentPrompt(huntName, changes, vertical));
+  writeIpcTask(taskId, buildUrgentPrompt(huntId, huntName, changes, vertical));
   logger.info({ taskId, huntId, changeCount: changes.length }, 'Urgent notification sent via IPC');
 }
 
@@ -178,9 +178,10 @@ export function sendNewOffersNotification(
   }
   lines.push(
     'In each sub-agent prompt include: the hunt id, the offer count to triage, and these instructions — ' +
-      'call get_hunt_summary for context, then list_offers (hunt_offer_status=new, oldest first, limit to the announced count), ' +
+      'call get_hunt_summary for context, then list_offers (hunt_offer_status=new, order=queued_oldest_first, limit to the announced count), ' +
       'evaluate against the hunt criteria, record every decision with record_evaluation or batch_dismiss, ' +
-      'and return a compact summary: alert/watch/dismiss counts plus a one-line reason per ALERT.',
+      'and return a compact summary: alert/watch/dismiss counts plus a one-line reason per ALERT. ' +
+      'Any listing previews above are a sample only — the sub-agent selects the actual batch via list_offers.',
   );
   lines.push(
     'When each sub-agent returns: relay ALERT items to the user (link + price + one-line reason), then call log_hunt_run.',
@@ -195,7 +196,7 @@ export function sendNewOffersNotification(
 export function sendPriceChangeNotification(huntId: number, huntName: string, changes: Change[], vertical: string): void {
   const taskId = `watcher-price-${Date.now()}-${randomUUID().slice(0, 8)}`;
 
-  const lines = [`Deal Hunter — Price change on watched offer — Hunt: "${huntName}"`, ''];
+  const lines = [`Deal Hunter — Price change on watched offer — Hunt: "${huntName}" (ID ${huntId})`, ''];
   for (const change of changes) {
     const direction = change.type === 'price_drop' ? 'PRICE DROP' : 'PRICE INCREASE';
     lines.push(
@@ -206,7 +207,7 @@ export function sendPriceChangeNotification(huntId: number, huntName: string, ch
   }
   const evaluatorAgent = resolveEvaluatorAgent(vertical);
   lines.push(
-    `Spawn the "${evaluatorAgent}" sub-agent (Task tool) to reassess the offer(s) above — pass it the hunt name and source IDs, ` +
+    `Spawn the "${evaluatorAgent}" sub-agent (Task tool) to reassess the offer(s) above — pass it hunt_id=${huntId} and the source IDs, ` +
       'and instruct it to review context via get_hunt_summary, reassess each price change against the hunt criteria, ' +
       'record decisions with record_evaluation, and return a short verdict per item. Relay its verdicts to the user.',
   );

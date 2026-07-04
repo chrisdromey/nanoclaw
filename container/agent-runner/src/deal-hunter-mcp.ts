@@ -778,6 +778,12 @@ server.tool(
     watching_only: z.boolean().optional(),
     limit: z.number().optional().describe('Max results (default 50, max 200)'),
     page: z.number().min(1).default(1).describe('Page number for pagination'),
+    order: z
+      .enum(['newest', 'queued_oldest_first'])
+      .optional()
+      .describe(
+        "Row order. 'newest' (default): last_seen_at DESC. 'queued_oldest_first': first_associated_at ASC — use when triaging a hunt backlog so the oldest queued offers are evaluated before the stale-queue flush can dismiss them (requires hunt_id).",
+      ),
   },
   async (args) => {
     const conditions: string[] = [];
@@ -838,7 +844,12 @@ server.tool(
          lp.price, lp.shipping, lp.total_landed_gbp,
          ${triageExtras}`;
 
-    const query = `SELECT ${selectCols} FROM offers o ${joins.join(' ')} ${whereClause} ORDER BY o.last_seen_at DESC LIMIT ? OFFSET ?`;
+    // queued_oldest_first only makes sense (and only has ho.* available) with a hunt_id filter.
+    const orderClause =
+      args.order === 'queued_oldest_first' && args.hunt_id
+        ? 'ORDER BY ho.first_associated_at ASC'
+        : 'ORDER BY o.last_seen_at DESC';
+    const query = `SELECT ${selectCols} FROM offers o ${joins.join(' ')} ${whereClause} ${orderClause} LIMIT ? OFFSET ?`;
     params.push(limit + 1, offset); // fetch one extra to detect has_more
 
     const rows = db.prepare(query).all(...params) as any[];

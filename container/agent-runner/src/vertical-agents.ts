@@ -122,7 +122,7 @@ const FALLBACK_VERTICAL_CAPS: Array<VerticalCaps & { agent: NonNullable<Vertical
   {
     name: 'computers',
     evaluator_skill: 'listing-evaluation',
-    sourcing_skill: 'deal-sourcing',
+    sourcing_skill: 'ebay-sourcing',
     sources: ['ebay'],
     agent: {
       name: 'deal-evaluator',
