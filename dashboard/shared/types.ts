@@ -292,6 +292,10 @@ export interface BaselinePrice {
   source_item_id: string | null;
   tags: string;
   created_at: string;
+  // Vertical-specific extras for comps (e.g. cars: mileage_num, year). JSON
+  // string in the DB; optional because the column is a later additive
+  // migration and older API payloads may omit it.
+  attributes?: string;
 }
 
 export interface SegmentWithStats extends MarketSegment {
@@ -311,6 +315,11 @@ export interface HuntBaselineData {
     current_price: number | null;
     condition: string | null;
     buying_format: string | null;
+    source: string;
+    auction_end_time: string | null;
+    // Vertical-specific extras (mileage, year, price opinion, features…).
+    // Parsed server-side; `{}` when the offer has none.
+    attributes: Record<string, unknown>;
   }>;
 }
 
@@ -350,4 +359,91 @@ export interface HuntDailyStat {
 export interface HuntActivityData {
   log_entries: HuntLogEntry[];
   daily_stats: HuntDailyStat[];
+}
+
+// --- Vertical attribute contract (source-neutral typed layer over offer.attributes) ---
+
+/** One normalised feature/equipment item on a listing (e.g. a car option). */
+export interface NormalisedFeatureItem {
+  name: string;
+  /** 'Standard' | 'Optional' where the source distinguishes; other strings or null otherwise. */
+  type: 'Standard' | 'Optional' | string | null;
+}
+
+/** A category of normalised features (e.g. "Driver Convenience"). */
+export interface NormalisedFeatureCategory {
+  category: string;
+  items: NormalisedFeatureItem[];
+}
+
+/**
+ * A source's own opinion of a listing's price — an optional capability any
+ * source adapter MAY provide. Tier values seen so far:
+ * LOW / GREAT / GOOD / FAIR / HIGH / NOANALYSIS (kept open as string).
+ */
+export interface SourcePriceOpinion {
+  source: string;
+  tier: string;
+  label: string | null;
+  /** Deviation from the source's market estimate; negative = below market. */
+  deviation_gbp: number | null;
+}
+
+/**
+ * Typed view over a cars offer's `attributes` record. All fields optional —
+ * populate only what the source provided. Parse via lib/attributes.ts; do not
+ * reach into Record<string, unknown> elsewhere.
+ */
+export interface CarAttributes {
+  year?: number;
+  mileage_num?: number;
+  mileage_text?: string;
+  fuel?: string;
+  transmission?: string;
+  body_type?: string;
+  colour?: string;
+  seller_type?: string;
+  seller_name?: string;
+  location_text?: string;
+  distance_miles?: number;
+  make?: string;
+  model?: string;
+  owners?: number;
+  price_tier?: string;
+  price_tier_label?: string;
+  price_deviation_gbp?: number;
+  features?: NormalisedFeatureCategory[];
+}
+
+// --- Hunt targets / provenance types ---
+
+/** One independently checked claim about a target (from claim_verifications). */
+export interface TargetVerification {
+  feature: string;
+  verdict: 'verified' | 'unverified' | 'contradicted' | string;
+  evidence_url: string | null;
+  notes: string | null;
+  checked_at: string;
+}
+
+/** Knowledge-base coverage metadata for a target (from knowledge_base). */
+export interface TargetKb {
+  kb_path: string;
+  citation_count: number;
+  must_have_citations: Record<string, number>;
+  built_at: string;
+}
+
+export interface TargetInfo {
+  target_key: string;
+  criteria: Record<string, unknown> | null;
+  kb: TargetKb | null;
+  verifications: TargetVerification[];
+}
+
+export interface HuntTargetsData {
+  hunt_id: number;
+  vertical: string;
+  must_have: string[];
+  targets: TargetInfo[];
 }

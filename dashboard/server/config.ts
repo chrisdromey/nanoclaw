@@ -10,6 +10,11 @@ export const DEAL_HUNTER_DB = path.resolve(
     path.join(NANOCLAW_ROOT, 'groups/telegram_main/deal-hunter.db'),
 );
 
+// The group directory the deal-hunter DB lives in. Relative file paths stored
+// in the DB (e.g. knowledge_base.kb_path) resolve against this, and served
+// files must stay inside it (traversal guard in routes/targets.ts).
+export const GROUP_DIR = path.dirname(DEAL_HUNTER_DB);
+
 export const NANOCLAW_DB = path.resolve(
   process.env.NANOCLAW_DB ||
     path.join(NANOCLAW_ROOT, 'store/messages.db'),

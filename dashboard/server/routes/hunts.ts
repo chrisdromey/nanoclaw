@@ -3,6 +3,7 @@ import { getDealDb } from '../db.js';
 import { checkOfferStatusBySource } from '../sources/index.js';
 import { evaluateActivationGate, type HuntRow } from '../deal-hunter-gate.js';
 import { computeReadiness } from '../hunt-readiness.js';
+import { parseJsonField } from '../parse.js';
 
 // Shared subquery fragment: provenance-gate readiness counts (segments, KB coverage, verifications).
 const READINESS_COUNTS_SQL = `
@@ -19,11 +20,6 @@ function readinessFor(h: Record<string, unknown>) {
       verified_count: (h.verified_count as number) ?? 0,
     },
   );
-}
-
-function parseJsonField<T>(value: string | null | undefined, fallback: T): T {
-  if (!value) return fallback;
-  try { return JSON.parse(value) as T; } catch { return fallback; }
 }
 
 /**

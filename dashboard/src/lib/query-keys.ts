@@ -15,6 +15,9 @@ export const queryKeys = {
     segmentPrices: (id: number, segmentId: number) =>
       ['hunts', id, 'segments', segmentId, 'prices'] as const,
     baseline: (id: number) => ['hunts', id, 'baseline'] as const,
+    targets: (id: number) => ['hunts', id, 'targets'] as const,
+    targetKb: (id: number, targetKey: string) =>
+      ['hunts', id, 'targets', targetKey, 'kb'] as const,
     activity: (id: number, period?: string) =>
       ['hunts', id, 'activity', period] as const,
   },

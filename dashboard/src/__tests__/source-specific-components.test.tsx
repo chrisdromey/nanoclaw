@@ -62,6 +62,7 @@ const carsOffer: Offer = {
     seller_type: 'trade',
     location_text: 'Leicester (3 miles)',
     distance_miles: 12,
+    price_tier: 'GREAT',
     price_tier_label: 'Great Price',
     price_deviation_gbp: -1732,
   },
@@ -124,7 +125,7 @@ describe('ViewOnSourceLink', () => {
 
 describe('CarAttributesBlock', () => {
   it('renders all car-specific attributes', () => {
-    render(<CarAttributesBlock attributes={carsOffer.attributes} />);
+    render(<CarAttributesBlock attributes={carsOffer.attributes} source="autotrader" />);
     expect(screen.getByText('2019')).toBeInTheDocument();
     expect(screen.getByText('45,000 miles')).toBeInTheDocument();
     expect(screen.getByText('Diesel')).toBeInTheDocument();
@@ -138,33 +139,60 @@ describe('CarAttributesBlock', () => {
     // The raw "(3 miles)" suffix should NOT appear in location; distance_miles covers it separately
     expect(screen.queryByText(/\(3 miles\)/)).not.toBeInTheDocument();
     expect(screen.getByText(/12 mi/)).toBeInTheDocument();
+    // Price-opinion row is relabelled with the offer's source
+    expect(screen.getByText(/Source opinion — autotrader/)).toBeInTheDocument();
     expect(screen.getByText('Great Price')).toBeInTheDocument();
     expect(screen.getByText(/below market/)).toBeInTheDocument();
   });
 
   it('renders nothing when attributes are empty', () => {
-    const { container } = render(<CarAttributesBlock attributes={{}} />);
+    const { container } = render(<CarAttributesBlock attributes={{}} source="autotrader" />);
     expect(container.firstChild).toBeNull();
   });
 
   it('renders gracefully when some attributes are missing', () => {
-    render(<CarAttributesBlock attributes={{ year: 2020, mileage_text: '30k miles' }} />);
+    render(
+      <CarAttributesBlock
+        attributes={{ year: 2020, mileage_text: '30k miles' }}
+        source="autotrader"
+      />,
+    );
     expect(screen.getByText('2020')).toBeInTheDocument();
     expect(screen.getByText('30k miles')).toBeInTheDocument();
     // Should not throw even without fuel, body, seller_type, or location_text.
   });
 
   it('renders gracefully when seller_type and location_text are absent', () => {
-    render(<CarAttributesBlock attributes={{ year: 2021, price_tier_label: 'Fair Price' }} />);
+    render(
+      <CarAttributesBlock
+        attributes={{ year: 2021, price_tier: 'FAIR', price_tier_label: 'Fair Price' }}
+        source="autotrader"
+      />,
+    );
     expect(screen.getByText('2021')).toBeInTheDocument();
     expect(screen.getByText('Fair Price')).toBeInTheDocument();
+    expect(screen.getByText(/Source opinion — autotrader/)).toBeInTheDocument();
     // No seller/location rows rendered
     expect(screen.queryByText('Seller')).not.toBeInTheDocument();
     expect(screen.queryByText('Location')).not.toBeInTheDocument();
   });
 
+  it('does not render an opinion row when the source offered no analysis', () => {
+    render(
+      <CarAttributesBlock
+        attributes={{ year: 2021, price_tier: 'NOANALYSIS', price_tier_label: 'Great Price' }}
+        source="autotrader"
+      />,
+    );
+    expect(screen.getByText('2021')).toBeInTheDocument();
+    expect(screen.queryByText(/Source opinion/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Great Price')).not.toBeInTheDocument();
+  });
+
   it('strips "(X miles)" suffix from AT location_text and shows only the city', () => {
-    render(<CarAttributesBlock attributes={{ location_text: 'Birmingham (8 miles)' }} />);
+    render(
+      <CarAttributesBlock attributes={{ location_text: 'Birmingham (8 miles)' }} source="autotrader" />,
+    );
     expect(screen.getByText('Birmingham')).toBeInTheDocument();
     expect(screen.queryByText(/\(8 miles\)/)).not.toBeInTheDocument();
   });

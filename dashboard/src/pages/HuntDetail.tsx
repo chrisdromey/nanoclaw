@@ -6,12 +6,14 @@ import { queryKeys } from '@/lib/query-keys';
 import { formatRelativeTime } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import StatusBadge from '@/components/shared/StatusBadge';
+import TargetsStrip from '@/components/verticals/cars/TargetsStrip';
+import { getVerticalUI } from '@/lib/verticals/registry';
 import HuntTabBar, { type HuntTab } from '@/components/hunts/HuntTabBar';
 import MarketTab from '@/components/hunts/MarketTab';
 import OffersTab from '@/components/hunts/OffersTab';
 import ActivityTab from '@/components/hunts/ActivityTab';
 import SettingsTab from '@/components/hunts/SettingsTab';
-import type { Hunt } from '@shared/types';
+import type { Hunt, HuntTargetsData } from '@shared/types';
 import { Pause, Play, X } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -59,6 +61,16 @@ export default function HuntDetail() {
   const { data: hunt } = useQuery({
     queryKey: queryKeys.hunts.detail(huntId),
     queryFn: () => apiGet<HuntWithCounts>(`/hunts/${huntId}`),
+  });
+
+  // Hunt-scoped targets (Spec Explorer strip) — only for verticals that support it.
+  const supportsSpecExplorer = hunt
+    ? getVerticalUI(hunt.vertical).supportsSpecExplorer
+    : false;
+  const { data: targetsData } = useQuery({
+    queryKey: queryKeys.hunts.targets(huntId),
+    queryFn: () => apiGet<HuntTargetsData>(`/hunts/${huntId}/targets`),
+    enabled: supportsSpecExplorer,
   });
 
   const handleTabChange = (newTab: HuntTab) => {
@@ -190,6 +202,13 @@ export default function HuntDetail() {
           />
         </div>
       </div>
+
+      {/* Targets strip — slim, non-sticky row between the header block and tab content */}
+      {targetsData && targetsData.targets.length > 0 && (
+        <div className="mt-3">
+          <TargetsStrip huntId={huntId} targets={targetsData.targets} />
+        </div>
+      )}
 
       {/* Tab content */}
       <div className="mt-6">

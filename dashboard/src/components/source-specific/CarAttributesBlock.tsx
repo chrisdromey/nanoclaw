@@ -1,21 +1,11 @@
 import { cn } from '@/lib/utils';
 import { formatPrice } from '@/lib/format';
+import { parseCarAttributes, getSourcePriceOpinion } from '@/lib/attributes';
 
 interface CarAttributesBlockProps {
   attributes: Record<string, unknown>;
-}
-
-function attr(attributes: Record<string, unknown>, key: string): string | null {
-  const v = attributes[key];
-  if (v === undefined || v === null || v === '') return null;
-  return String(v);
-}
-
-function numAttr(attributes: Record<string, unknown>, key: string): number | null {
-  const v = attributes[key];
-  if (v === undefined || v === null) return null;
-  const n = Number(v);
-  return isNaN(n) ? null : n;
+  /** Offer source name (e.g. "autotrader") — labels the price-opinion row. */
+  source: string;
 }
 
 interface RowProps {
@@ -38,26 +28,29 @@ function Row({ label, value, mono }: RowProps) {
  * Renders car-specific attributes extracted from offer.attributes.
  * Gracefully skips any fields that are missing or null.
  */
-export default function CarAttributesBlock({ attributes }: CarAttributesBlockProps) {
-  const year = attr(attributes, 'year');
-  const mileageText = attr(attributes, 'mileage_text');
-  const fuel = attr(attributes, 'fuel');
-  const body = attr(attributes, 'body_type');
-  const transmission = attr(attributes, 'transmission');
-  const colour = attr(attributes, 'colour');
-  const sellerType = attr(attributes, 'seller_type');
-  // AT returns location_text like "Leicester (3 miles)"; display just the city name.
-  const rawLocationText = attr(attributes, 'location_text');
-  const locationText = rawLocationText ? rawLocationText.replace(/\s*\(.*?\)\s*$/, '').trim() || rawLocationText : null;
-  const distanceMiles = numAttr(attributes, 'distance_miles');
-  const priceTierLabel = attr(attributes, 'price_tier_label');
+export default function CarAttributesBlock({ attributes, source }: CarAttributesBlockProps) {
+  const attrs = parseCarAttributes(attributes);
+  const opinion = getSourcePriceOpinion(source, attributes);
 
-  // Deviation from market mid
-  const deviationGbp = numAttr(attributes, 'price_deviation_gbp');
+  const year = attrs.year != null ? String(attrs.year) : null;
+  const mileageText = attrs.mileage_text ?? null;
+  const fuel = attrs.fuel ?? null;
+  const body = attrs.body_type ?? null;
+  const transmission = attrs.transmission ?? null;
+  const colour = attrs.colour ?? null;
+  const sellerType = attrs.seller_type ?? null;
+  // AT returns location_text like "Leicester (3 miles)"; display just the city name.
+  const rawLocationText = attrs.location_text ?? null;
+  const locationText = rawLocationText ? rawLocationText.replace(/\s*\(.*?\)\s*$/, '').trim() || rawLocationText : null;
+  const distanceMiles = attrs.distance_miles ?? null;
+
+  // Source's own price opinion (tier label + deviation from its market estimate)
+  const opinionLabel = opinion ? (opinion.label ?? opinion.tier) : null;
+  const deviationGbp = opinion?.deviation_gbp ?? null;
 
   const hasAny =
     year || mileageText || fuel || body || transmission || colour ||
-    sellerType || locationText || distanceMiles != null || priceTierLabel;
+    sellerType || locationText || distanceMiles != null || opinionLabel;
 
   if (!hasAny) return null;
 
@@ -79,11 +72,11 @@ export default function CarAttributesBlock({ attributes }: CarAttributesBlockPro
             <span className="font-mono text-zinc-300">{distanceMiles} mi</span>
           </div>
         )}
-        {priceTierLabel && (
+        {opinionLabel && (
           <div className="flex items-baseline gap-3 text-sm">
-            <span className="text-zinc-500 w-28 shrink-0">Price tier</span>
+            <span className="text-zinc-500 w-28 shrink-0">Source opinion — {source}</span>
             <span className="text-zinc-300">
-              {priceTierLabel}
+              {opinionLabel}
               {deviationGbp != null && (
                 <span
                   className={cn(

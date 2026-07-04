@@ -87,6 +87,8 @@ listings you used:
   **required in practice**: the gate only counts comps that carry a source reference and a tag — that
   is what proves the comp is a real, deliberately-bucketed listing and not a number from memory.
   Record ≥3 such comps per segment (more is better). Add `total_landed_gbp` where shipping/fees apply.
+  For **cars** comps also pass `attributes: {"mileage_num": <miles>, "year": <year>}` — mileage makes
+  the comp usable in the depreciation-trend fit.
 
 **c) Derive the band** — call `recompute_segment_prices` (`hunt_id`, optional `segment_id`). It
 computes p25/median/p75 of the sourced comps and sets the segment's low/mid/high, sample size and

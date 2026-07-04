@@ -1,5 +1,7 @@
 import { Hono } from 'hono';
 import { getDealDb } from '../db.js';
+import { parseJsonField } from '../parse.js';
+import type { HuntBaselineData, SegmentWithStats } from '../../shared/types.js';
 
 export const baselineRoutes = new Hono();
 
@@ -88,9 +90,10 @@ baselineRoutes.get('/hunts/:id/baseline', (c) => {
     .get(huntId) as { count: number };
 
   // Current active watched offer prices for overlay comparison
-  const activeOfferPrices = db
+  const offerRows = db
     .prepare(
       `SELECT o.id as offer_id, o.title, o.condition, o.buying_format,
+        o.source, o.auction_end_time, o.attributes,
         (SELECT COALESCE(p.total_landed_gbp, p.price)
          FROM prices p WHERE p.offer_id = o.id
          ORDER BY p.observed_at DESC LIMIT 1) as current_price
@@ -99,11 +102,36 @@ baselineRoutes.get('/hunts/:id/baseline', (c) => {
       WHERE o.status = 'active' AND ho.status != 'dismissed'
       ORDER BY current_price ASC`,
     )
-    .all(huntId);
+    .all(huntId) as Array<{
+    offer_id: number;
+    title: string;
+    condition: string | null;
+    buying_format: string | null;
+    source: string;
+    auction_end_time: string | null;
+    attributes: string | null;
+    current_price: number | null;
+  }>;
 
-  return c.json({
-    segments,
+  // Parse the JSON `attributes` column so vertical-specific extras (mileage,
+  // year, price opinion…) arrive as an object; `{}` when the offer has none.
+  const activeOfferPrices: HuntBaselineData['active_offer_prices'] = offerRows.map(
+    (row) => ({
+      offer_id: row.offer_id,
+      title: row.title,
+      current_price: row.current_price,
+      condition: row.condition,
+      buying_format: row.buying_format,
+      source: row.source,
+      auction_end_time: row.auction_end_time,
+      attributes: parseJsonField(row.attributes, {}),
+    }),
+  );
+
+  const payload: HuntBaselineData = {
+    segments: segments as SegmentWithStats[],
     unclassified_count: unclassified.count,
     active_offer_prices: activeOfferPrices,
-  });
+  };
+  return c.json(payload);
 });

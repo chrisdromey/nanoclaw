@@ -215,7 +215,9 @@ function ensureSchema(db: Database.Database): void {
       source_url TEXT,
       source_item_id TEXT,
       tags TEXT NOT NULL DEFAULT '[]',
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- declared last so fresh DBs match the column order ALTER TABLE produces on migrated DBs
+      attributes TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS hunt_log (
@@ -320,6 +322,13 @@ function ensureSchema(db: Database.Database): void {
   }
   if (!offerCols.some((c) => c.name === 'attributes')) {
     db.exec("ALTER TABLE offers ADD COLUMN attributes TEXT DEFAULT '{}'");
+  }
+
+  // baseline_prices: structured comp attributes (e.g. cars mileage_num/year) so research comps
+  // can feed the depreciation-trend fit, not just live offers.
+  const baselineCols = db.prepare("PRAGMA table_info('baseline_prices')").all() as Array<{ name: string }>;
+  if (!baselineCols.some((c) => c.name === 'attributes')) {
+    db.exec("ALTER TABLE baseline_prices ADD COLUMN attributes TEXT NOT NULL DEFAULT '{}'");
   }
 
   // hunts table: vertical, sources, poll_interval_minutes

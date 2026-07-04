@@ -14,6 +14,7 @@ import { searchRoutes } from './routes/searches.js';
 import { agentRoutes } from './routes/agent.js';
 import { eventRoutes } from './routes/events.js';
 import { baselineRoutes } from './routes/baseline.js';
+import { targetsRoutes } from './routes/targets.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -31,6 +32,7 @@ app.route('/api', searchRoutes);
 app.route('/api', agentRoutes);
 app.route('/api', eventRoutes);
 app.route('/api', baselineRoutes);
+app.route('/api', targetsRoutes);
 
 // Health check
 app.get('/api/health', (c) => c.json({ ok: true }));

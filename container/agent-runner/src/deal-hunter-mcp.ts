@@ -1338,6 +1338,7 @@ server.tool(
       source_url: z.string().optional(),
       source_item_id: z.string().optional(),
       tags: z.string().optional().describe('JSON array of attribute tags'),
+      attributes: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional().describe('Structured comp attributes using the vertical contract keys. For cars comps record {"mileage_num": <miles as number>, "year": <year>} — mileage makes the comp usable in the depreciation-trend fit.'),
     })).describe('Array of price data points to record'),
   },
   async (args) => {
@@ -1354,8 +1355,8 @@ server.tool(
     }
 
     const insert = db.prepare(`
-      INSERT INTO baseline_prices (segment_id, hunt_id, source_type, title, price, shipping, total_landed_gbp, condition, sold_date, source_url, source_item_id, tags)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO baseline_prices (segment_id, hunt_id, source_type, title, price, shipping, total_landed_gbp, condition, sold_date, source_url, source_item_id, tags, attributes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const recordAll = db.transaction(() => {
@@ -1366,6 +1367,7 @@ server.tool(
           item.condition || null, item.sold_date || null,
           item.source_url || null, item.source_item_id || null,
           item.tags || '[]',
+          JSON.stringify(item.attributes ?? {}),
         );
       }
     });

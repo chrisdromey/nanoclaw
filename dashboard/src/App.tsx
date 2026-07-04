@@ -3,6 +3,7 @@ import MainLayout from './components/layout/MainLayout';
 import Overview from './pages/Overview';
 import Hunts from './pages/Hunts';
 import HuntDetail from './pages/HuntDetail';
+import SpecExplorer from './pages/SpecExplorer';
 import HuntPricesRedirect from './pages/HuntPricesRedirect';
 import HuntActivityRedirect from './pages/HuntActivityRedirect';
 import Watched from './pages/Watched';
@@ -20,6 +21,7 @@ export default function App() {
         <Route path="/" element={<Overview />} />
         <Route path="/hunts" element={<Hunts />} />
         <Route path="/hunts/:id" element={<HuntDetail />} />
+        <Route path="/hunts/:id/models/:targetKey" element={<SpecExplorer />} />
         <Route path="/hunts/:id/prices" element={<HuntPricesRedirect />} />
         <Route path="/hunts/:id/activity" element={<HuntActivityRedirect />} />
         <Route path="/watched" element={<Watched />} />

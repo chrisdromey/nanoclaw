@@ -30,6 +30,7 @@ vi.mock('../../server/sources/index.js', () => ({
 
 import { offerRoutes } from '../../server/routes/offers';
 import { huntRoutes } from '../../server/routes/hunts';
+import { baselineRoutes } from '../../server/routes/baseline';
 
 const CARS_ATTRIBUTES = { year: 2019, mileage_text: '45,000 miles' };
 
@@ -47,6 +48,8 @@ beforeEach(() => {
       source TEXT,
       source_id TEXT,
       title TEXT,
+      condition TEXT,
+      buying_format TEXT,
       status TEXT,
       watching INTEGER,
       auction_end_time TEXT,
@@ -69,7 +72,16 @@ beforeEach(() => {
     );
     CREATE TABLE market_segments (
       id INTEGER PRIMARY KEY,
-      hunt_id INTEGER
+      hunt_id INTEGER,
+      name TEXT,
+      created_at TEXT
+    );
+    CREATE TABLE baseline_prices (
+      id INTEGER PRIMARY KEY,
+      segment_id INTEGER,
+      hunt_id INTEGER,
+      source_type TEXT,
+      observed_at TEXT
     );
     CREATE TABLE knowledge_base (id INTEGER PRIMARY KEY, hunt_id INTEGER);
     CREATE TABLE claim_verifications (id INTEGER PRIMARY KEY, hunt_id INTEGER, verdict TEXT);
@@ -116,5 +128,79 @@ describe('GET /hunts/:id/offers returns parsed attributes', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { sources: string[] };
     expect(body.sources).toEqual(['autotrader']);
+  });
+});
+
+describe('GET /hunts/:id/baseline active_offer_prices', () => {
+  interface BaselineOfferRow {
+    offer_id: number;
+    title: string;
+    current_price: number | null;
+    condition: string | null;
+    buying_format: string | null;
+    source: string;
+    auction_end_time: string | null;
+    attributes: Record<string, unknown>;
+  }
+
+  // Extra offers only the baseline tests need (nested beforeEach runs after
+  // the outer one). watching=0 + hunt_offers status 'evaluated' keeps them out
+  // of the /watched and /hunts/:id/offers?status=watching assertions above.
+  beforeEach(() => {
+    const insertOffer = db.prepare(
+      `INSERT INTO offers (id, source, source_id, title, condition, buying_format, status, watching, auction_end_time, last_seen_at, attributes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    // eBay auction offer: NULL attributes, auction_end_time set (the latent
+    // bug — this column was never selected, so "ending soon" could not fire).
+    insertOffer.run(11, 'ebay', 'ebay-111', 'ThinkStation P620', 'Used', 'AUCTION', 'active', 0, '2024-06-01T12:00:00Z', '2024-01-02T00:00:00', null);
+    // eBay-style offer with the adapter's default empty attributes JSON.
+    insertOffer.run(12, 'ebay', 'ebay-222', 'Dell Precision 7920', 'Refurbished', 'FIXED_PRICE', 'active', 0, null, '2024-01-02T00:00:00', '{}');
+    const insertHuntOffer = db.prepare(
+      'INSERT INTO hunt_offers (hunt_id, offer_id, status, first_associated_at) VALUES (?, ?, ?, ?)',
+    );
+    insertHuntOffer.run(1, 11, 'evaluated', '2024-01-01T00:00:00');
+    insertHuntOffer.run(1, 12, 'evaluated', '2024-01-01T00:00:00');
+    const insertPrice = db.prepare(
+      'INSERT INTO prices (offer_id, price, shipping, total_landed_gbp, observed_at) VALUES (?, ?, ?, ?, ?)',
+    );
+    insertPrice.run(11, 900, 0, 900, '2024-01-02T00:00:00');
+    insertPrice.run(12, 1200, 0, 1200, '2024-01-02T00:00:00');
+  });
+
+  async function fetchRows(): Promise<Map<number, BaselineOfferRow>> {
+    const res = await baselineRoutes.request('/hunts/1/baseline');
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { active_offer_prices: BaselineOfferRow[] };
+    return new Map(body.active_offer_prices.map((r) => [r.offer_id, r]));
+  }
+
+  it('rows carry source and auction_end_time', async () => {
+    const rows = await fetchRows();
+    expect(rows.get(11)?.source).toBe('ebay');
+    expect(rows.get(11)?.auction_end_time).toBe('2024-06-01T12:00:00Z');
+    expect(rows.get(10)?.source).toBe('autotrader');
+    expect(rows.get(10)?.auction_end_time).toBeNull();
+  });
+
+  it('returns attributes parsed to an object', async () => {
+    const rows = await fetchRows();
+    expect(rows.get(10)?.attributes).toEqual(CARS_ATTRIBUTES);
+    expect((rows.get(10)?.attributes as { year?: number }).year).toBe(2019);
+  });
+
+  it("NULL and '{}' attributes both come back as {}", async () => {
+    const rows = await fetchRows();
+    expect(rows.get(11)?.attributes).toEqual({});
+    expect(rows.get(12)?.attributes).toEqual({});
+  });
+
+  it('eBay-style rows are otherwise unaffected', async () => {
+    const rows = await fetchRows();
+    const ebay = rows.get(12);
+    expect(ebay?.title).toBe('Dell Precision 7920');
+    expect(ebay?.condition).toBe('Refurbished');
+    expect(ebay?.buying_format).toBe('FIXED_PRICE');
+    expect(ebay?.current_price).toBe(1200);
   });
 });

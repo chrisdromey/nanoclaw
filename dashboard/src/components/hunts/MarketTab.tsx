@@ -8,8 +8,20 @@ import { cn } from '@/lib/utils';
 import { matchToSegment, assessPrice, assessmentColor } from '@/lib/segment-matcher';
 import StatusBadge from '@/components/shared/StatusBadge';
 import PriceTierBar, { priceToPct } from '@/components/shared/PriceTierBar';
+import {
+  getVerticalUI,
+  type ParsedBaselineOffer,
+} from '@/lib/verticals/registry';
+import { parseCarAttributes, parseFeatures } from '@/lib/attributes';
+import {
+  fitLinearTrend,
+  residualDealThreshold,
+  type LinearTrendFit,
+} from '@/lib/regression';
+import TargetsStrip from '@/components/verticals/cars/TargetsStrip';
 import type {
   HuntBaselineData,
+  HuntTargetsData,
   SegmentWithStats,
   BaselinePrice,
 } from '@shared/types';
@@ -34,9 +46,7 @@ const SEGMENT_COLORS = [
   '#06B6D4', // cyan
 ];
 
-type ActiveOffer = HuntBaselineData['active_offer_prices'][number];
-
-function isAuction(offer: ActiveOffer) {
+function isAuction(offer: ParsedBaselineOffer) {
   return offer.buying_format?.includes('AUCTION') ?? false;
 }
 
@@ -49,6 +59,21 @@ function offerDotClasses(assessment: ReturnType<typeof assessPrice>, auction: bo
   return `border border-zinc-900 ${fill}`;
 }
 
+/**
+ * Tooltip suffix for an offer dot: signed residual vs the segment's trend fit
+ * when computable (cars). Empty string otherwise — band-only verticals see
+ * exactly the original tooltip text.
+ */
+function residualTitleSuffix(
+  offer: ParsedBaselineOffer,
+  fit: LinearTrendFit | undefined,
+): string {
+  if (!fit || offer.current_price == null || offer.carAttrs?.mileage_num == null) return '';
+  const res = offer.current_price - fit.predict(offer.carAttrs.mileage_num);
+  const amount = `£${Math.round(Math.abs(res)).toLocaleString('en-GB')}`;
+  return `\n${amount} ${res <= 0 ? 'under' : 'over'} trend for its mileage`;
+}
+
 interface MarketTabProps {
   huntId: number;
   budget: number | null;
@@ -56,8 +81,7 @@ interface MarketTabProps {
 }
 
 export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) {
-  const isComputers = !vertical || vertical === 'computers';
-  const isCars = vertical === 'cars';
+  const ui = getVerticalUI(vertical);
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
   const [expandedSegment, setExpandedSegment] = useState<number | null>(null);
 
@@ -66,6 +90,33 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
     queryFn: () => apiGet<HuntBaselineData>(`/hunts/${huntId}/baseline`),
     staleTime: 60_000,
   });
+
+  const { data: targetsData } = useQuery({
+    queryKey: queryKeys.hunts.targets(huntId),
+    queryFn: () => apiGet<HuntTargetsData>(`/hunts/${huntId}/targets`),
+    staleTime: 60_000,
+    enabled: ui.supportsMustHaveVerification || ui.supportsSpecExplorer,
+  });
+  const mustHaves = targetsData?.must_have ?? [];
+  const targets = targetsData?.targets ?? [];
+
+  // --- Parse offers ONCE into typed rows (superset of the raw row) ---
+  const parsedOffers = useMemo<ParsedBaselineOffer[]>(() => {
+    if (!baseline) return [];
+    const wantsCarAttrs =
+      ui.primaryDealSignal === 'trend-residual' ||
+      ui.supportsSourcePriceOpinion ||
+      ui.supportsMustHaveVerification;
+    return baseline.active_offer_prices.map((offer) =>
+      wantsCarAttrs
+        ? {
+            ...offer,
+            carAttrs: parseCarAttributes(offer.attributes),
+            features: parseFeatures(offer.attributes),
+          }
+        : offer,
+    );
+  }, [baseline, ui]);
 
   // --- Tag filtering ---
   const allTags = useMemo(() => {
@@ -103,11 +154,11 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
 
   // --- Offer-to-segment matching ---
   const { offersBySegment, unmatchedOffers } = useMemo(() => {
-    const map = new Map<number, ActiveOffer[]>();
-    const unmatched: ActiveOffer[] = [];
+    const map = new Map<number, ParsedBaselineOffer[]>();
+    const unmatched: ParsedBaselineOffer[] = [];
     if (!baseline) return { offersBySegment: map, unmatchedOffers: unmatched };
 
-    for (const offer of baseline.active_offer_prices) {
+    for (const offer of parsedOffers) {
       if (offer.current_price == null) continue;
       const match = matchToSegment(offer.title, baseline.segments);
       if (match) {
@@ -119,7 +170,55 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
       }
     }
     return { offersBySegment: map, unmatchedOffers: unmatched };
-  }, [baseline]);
+  }, [baseline, parsedOffers]);
+
+  // --- Per-segment trend fits (trend-residual verticals only) ---
+  const segmentFits = useMemo(() => {
+    const fits = new Map<number, LinearTrendFit>();
+    if (ui.primaryDealSignal !== 'trend-residual') return fits;
+    for (const [segmentId, offers] of offersBySegment) {
+      const fit = fitLinearTrend(
+        offers
+          .filter((o) => o.current_price != null && o.carAttrs?.mileage_num != null)
+          .map((o) => ({ x: o.carAttrs!.mileage_num!, y: o.current_price! })),
+      );
+      if (fit) fits.set(segmentId, fit);
+    }
+    return fits;
+  }, [offersBySegment, ui]);
+
+  const underTrendCount = useMemo(() => {
+    if (ui.primaryDealSignal !== 'trend-residual') return 0;
+    let count = 0;
+    for (const [segmentId, offers] of offersBySegment) {
+      const fit = segmentFits.get(segmentId);
+      if (!fit) continue;
+      for (const offer of offers) {
+        if (offer.current_price == null || offer.carAttrs?.mileage_num == null) continue;
+        const predicted = fit.predict(offer.carAttrs.mileage_num);
+        if (offer.current_price - predicted <= -residualDealThreshold(predicted)) count++;
+      }
+    }
+    return count;
+  }, [offersBySegment, segmentFits, ui]);
+
+  // --- Spec-sheet links: segments whose tags contain a known target_key ---
+  const specTargetBySegment = useMemo(() => {
+    const map = new Map<number, string>();
+    if (!ui.supportsSpecExplorer || !baseline || targets.length === 0) return map;
+    for (const seg of baseline.segments) {
+      try {
+        const tags = JSON.parse(seg.tags) as string[];
+        const hit = targets.find((t) =>
+          tags.some(
+            (tag) => typeof tag === 'string' && tag.toLowerCase() === t.target_key.toLowerCase(),
+          ),
+        );
+        if (hit) map.set(seg.id, hit.target_key);
+      } catch { /* skip */ }
+    }
+    return map;
+  }, [baseline, targets, ui]);
 
   // --- Deal summary stats ---
   const summary = useMemo(() => {
@@ -128,7 +227,7 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
     let urgentAuctions = 0;
     const urgentItems: Array<{ offer_id: number; title: string; price: number; countdown: string }> = [];
 
-    for (const offer of baseline.active_offer_prices) {
+    for (const offer of parsedOffers) {
       if (offer.current_price == null) continue;
       const match = matchToSegment(offer.title, baseline.segments);
       if (match) {
@@ -136,8 +235,8 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
         if (assessment === 'good') goodDeals++;
       }
       // Check for urgent auctions among all offers
-      if (isAuction(offer) && (offer as any).auction_end_time) {
-        const urgency = getCountdownUrgency((offer as any).auction_end_time);
+      if (ui.showAuctionUrgency && isAuction(offer) && offer.auction_end_time) {
+        const urgency = getCountdownUrgency(offer.auction_end_time);
         if (urgency === 'critical' || urgency === 'warning') {
           urgentAuctions++;
           if (urgentItems.length < 2) {
@@ -145,7 +244,7 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
               offer_id: offer.offer_id,
               title: offer.title,
               price: offer.current_price!,
-              countdown: formatCountdown((offer as any).auction_end_time) || '',
+              countdown: formatCountdown(offer.auction_end_time) || '',
             });
           }
         }
@@ -168,27 +267,32 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
       priceSpread: minPrice < Infinity ? { min: minPrice, max: maxPrice } : null,
       segmentCount: baseline.segments.length,
     };
-  }, [baseline]);
+  }, [baseline, parsedOffers, ui]);
 
   const hasSegments = baseline && baseline.segments.length > 0;
 
-  // Cars vertical: per-segment analytics deferred to Stage 2
-  if (isCars) {
-    return (
-      <div className="animate-feed-in py-12 text-center text-zinc-500 text-sm">
-        Per-segment analytics not yet available for cars hunts.
-      </div>
-    );
-  }
+  const AnalyticsPanel = ui.SegmentAnalyticsPanel;
+  const ExtraPanel = ui.MarketExtraPanel;
 
   return (
     <div className="animate-feed-in space-y-6">
       {/* Deal Summary Strip */}
       {summary && hasSegments && (
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
-          <span className={cn('font-mono', summary.goodDeals > 0 ? 'text-success' : 'text-zinc-500')}>
-            {summary.goodDeals} <span className="text-xs font-sans">good deal{summary.goodDeals !== 1 ? 's' : ''}</span>
-          </span>
+          {ui.primaryDealSignal === 'trend-residual' ? (
+            <>
+              <span className={cn('font-mono', underTrendCount > 0 ? 'text-success' : 'text-zinc-500')}>
+                {underTrendCount} <span className="text-xs font-sans">under trend</span>
+              </span>
+              <span className="font-mono text-xs text-zinc-500">
+                {summary.goodDeals} <span className="font-sans">below band</span>
+              </span>
+            </>
+          ) : (
+            <span className={cn('font-mono', summary.goodDeals > 0 ? 'text-success' : 'text-zinc-500')}>
+              {summary.goodDeals} <span className="text-xs font-sans">good deal{summary.goodDeals !== 1 ? 's' : ''}</span>
+            </span>
+          )}
           {summary.urgentAuctions > 0 && (
             <span className="text-warning font-mono">
               {summary.urgentAuctions} <span className="text-xs font-sans">auction{summary.urgentAuctions !== 1 ? 's' : ''} ending soon</span>
@@ -204,6 +308,11 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
             {summary.activeOffers} <span className="text-xs font-sans">tracked</span>
           </span>
         </div>
+      )}
+
+      {/* Targets strip — model chips linking to Spec Explorer */}
+      {ui.supportsSpecExplorer && targets.length > 0 && (
+        <TargetsStrip huntId={huntId} targets={targets} />
       )}
 
       {/* Attention row — urgent items */}
@@ -263,9 +372,20 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
       {hasSegments && filteredSegments.length > 0 && (
         <MarketOverview
           segments={filteredSegments}
-          activeOffers={baseline.active_offer_prices}
+          activeOffers={parsedOffers}
           offersBySegment={offersBySegment}
           budget={budget}
+          showAuctionUrgency={ui.showAuctionUrgency}
+          segmentFits={segmentFits}
+        />
+      )}
+
+      {/* Vertical-specific hunt-wide panel (e.g. cars source-opinion cross-check) */}
+      {hasSegments && ExtraPanel && (
+        <ExtraPanel
+          huntId={huntId}
+          segments={filteredSegments}
+          offersBySegment={offersBySegment}
         />
       )}
 
@@ -282,7 +402,20 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
               budget={budget}
               expanded={expandedSegment === segment.id}
               onToggle={() => setExpandedSegment(expandedSegment === segment.id ? null : segment.id)}
-              showConditionBreakdown={isComputers}
+              showConditionBreakdown={ui.showConditionBreakdown}
+              showAuctionUrgency={ui.showAuctionUrgency}
+              fit={segmentFits.get(segment.id)}
+              specSheetTargetKey={specTargetBySegment.get(segment.id) ?? null}
+              analyticsPanel={
+                AnalyticsPanel ? (
+                  <AnalyticsPanel
+                    segment={segment}
+                    offers={offersBySegment.get(segment.id) || []}
+                    budget={budget}
+                    mustHaves={mustHaves}
+                  />
+                ) : undefined
+              }
             />
           ))}
         </div>
@@ -330,11 +463,15 @@ function MarketOverview({
   activeOffers,
   offersBySegment,
   budget,
+  showAuctionUrgency,
+  segmentFits,
 }: {
   segments: SegmentWithStats[];
-  activeOffers: HuntBaselineData['active_offer_prices'];
-  offersBySegment: Map<number, ActiveOffer[]>;
+  activeOffers: ParsedBaselineOffer[];
+  offersBySegment: Map<number, ParsedBaselineOffer[]>;
   budget: number | null;
+  showAuctionUrgency: boolean;
+  segmentFits: Map<number, LinearTrendFit>;
 }) {
   const { axisMin, axisMax, range } = useMemo(() => {
     let min = Infinity;
@@ -365,10 +502,10 @@ function MarketOverview({
       .map((o) => {
         const match = matchToSegment(o.title, segments);
         const assessment = match ? assessPrice(o.current_price, match.segment) : null;
-        const auction = isAuction(o);
+        const auction = showAuctionUrgency && isAuction(o);
         return { ...o, assessment, auction, left: pct(o.current_price!) };
       });
-  }, [activeOffers, segments, axisMin, range]);
+  }, [activeOffers, segments, axisMin, range, showAuctionUrgency]);
 
   const ticks = useMemo(() => {
     const step = Math.pow(10, Math.floor(Math.log10(range / 4)));
@@ -396,10 +533,12 @@ function MarketOverview({
             <span className="w-2.5 h-2.5 rounded-full bg-danger border border-zinc-900" />
             Overpriced
           </span>
-          <span className="flex items-center gap-1.5 ml-1 pl-2 border-l border-zinc-700">
-            <span className="w-2.5 h-2.5 rounded-full bg-transparent border-2 border-zinc-400" />
-            Auction
-          </span>
+          {showAuctionUrgency && (
+            <span className="flex items-center gap-1.5 ml-1 pl-2 border-l border-zinc-700">
+              <span className="w-2.5 h-2.5 rounded-full bg-transparent border-2 border-zinc-400" />
+              Auction
+            </span>
+          )}
         </div>
       </div>
 
@@ -444,7 +583,7 @@ function MarketOverview({
                 {(offersBySegment.get(seg.id) || []).map((offer) => {
                   if (offer.current_price == null) return null;
                   const assessment = assessPrice(offer.current_price, seg);
-                  const auction = isAuction(offer);
+                  const auction = showAuctionUrgency && isAuction(offer);
                   return (
                     <Link
                       key={offer.offer_id}
@@ -454,7 +593,7 @@ function MarketOverview({
                         offerDotClasses(assessment, auction),
                       )}
                       style={{ left: `${pct(offer.current_price)}%` }}
-                      title={`${offer.title}\n${formatPrice(offer.current_price)}${auction ? ' (Auction)' : ''}`}
+                      title={`${offer.title}\n${formatPrice(offer.current_price)}${auction ? ' (Auction)' : ''}${residualTitleSuffix(offer, segmentFits.get(seg.id))}`}
                     />
                   );
                 })}
@@ -574,15 +713,26 @@ function SegmentCard({
   expanded,
   onToggle,
   showConditionBreakdown = true,
+  showAuctionUrgency = true,
+  fit,
+  specSheetTargetKey = null,
+  analyticsPanel,
 }: {
   segment: SegmentWithStats;
   huntId: number;
   color: string;
-  matchedOffers: ActiveOffer[];
+  matchedOffers: ParsedBaselineOffer[];
   budget: number | null;
   expanded: boolean;
   onToggle: () => void;
   showConditionBreakdown?: boolean;
+  showAuctionUrgency?: boolean;
+  /** Segment trend fit (trend-residual verticals) — enriches dot tooltips. */
+  fit?: LinearTrendFit;
+  /** When set, the card links to this target's Spec Explorer page. */
+  specSheetTargetKey?: string | null;
+  /** Vertical-specific analytics rendered above the comps histogram. */
+  analyticsPanel?: React.ReactNode;
 }) {
   const tags: string[] = (() => {
     try { return JSON.parse(segment.tags); } catch { return []; }
@@ -642,6 +792,7 @@ function SegmentCard({
   }, [prices]);
 
   const hasPriceTier = segment.price_low != null && segment.price_high != null;
+  const hasBaselineAnalytics = !!(prices && prices.length > 0 && analytics);
 
   return (
     <div className="bg-surface border border-zinc-800 rounded-lg p-4" style={{ borderTopColor: color, borderTopWidth: 2 }}>
@@ -650,9 +801,23 @@ function SegmentCard({
           <h3 className="text-heading text-zinc-200">{segment.name}</h3>
           {segment.description && <p className="text-xs text-zinc-500 mt-0.5">{segment.description}</p>}
         </div>
-        <span className="text-xs text-zinc-500 whitespace-nowrap shrink-0" title={`Data confidence: ${segment.confidence.toLowerCase()} (${segment.sample_size} data points)`}>
-          {segment.sample_size} sample{segment.sample_size !== 1 ? 's' : ''}
-        </span>
+        {specSheetTargetKey ? (
+          <div className="flex flex-col items-end gap-1 shrink-0">
+            <span className="text-xs text-zinc-500 whitespace-nowrap" title={`Data confidence: ${segment.confidence.toLowerCase()} (${segment.sample_size} data points)`}>
+              {segment.sample_size} sample{segment.sample_size !== 1 ? 's' : ''}
+            </span>
+            <Link
+              to={`/hunts/${huntId}/models/${encodeURIComponent(specSheetTargetKey)}`}
+              className="text-xs text-accent hover:text-accent-hover whitespace-nowrap transition-colors"
+            >
+              Spec sheet →
+            </Link>
+          </div>
+        ) : (
+          <span className="text-xs text-zinc-500 whitespace-nowrap shrink-0" title={`Data confidence: ${segment.confidence.toLowerCase()} (${segment.sample_size} data points)`}>
+            {segment.sample_size} sample{segment.sample_size !== 1 ? 's' : ''}
+          </span>
+        )}
       </div>
 
       {hasPriceTier && (
@@ -661,7 +826,7 @@ function SegmentCard({
             {matchedOffers.map((offer) => {
               if (offer.current_price == null) return null;
               const assessment = assessPrice(offer.current_price, segment);
-              const auction = isAuction(offer);
+              const auction = showAuctionUrgency && isAuction(offer);
               const left = priceToPct(offer.current_price, segment);
               return (
                 <Link
@@ -672,7 +837,7 @@ function SegmentCard({
                     offerDotClasses(assessment, auction),
                   )}
                   style={{ left: `${left}%` }}
-                  title={`${offer.title}\n${formatPrice(offer.current_price)}${auction ? ' (Auction)' : ''}`}
+                  title={`${offer.title}\n${formatPrice(offer.current_price)}${auction ? ' (Auction)' : ''}${residualTitleSuffix(offer, fit)}`}
                 />
               );
             })}
@@ -705,78 +870,84 @@ function SegmentCard({
         {expanded ? 'Hide' : 'Show'} analytics ({segment.data_point_count})
       </button>
 
-      {expanded && prices && prices.length > 0 && analytics && (
+      {expanded && (analyticsPanel || hasBaselineAnalytics) && (
         <div className="mt-3 border-t border-zinc-800 pt-3 space-y-4">
-          <div className="flex flex-col lg:flex-row gap-4">
-            <div className="flex-1 min-w-0">
-              <h4 className="text-xs text-zinc-500 mb-2">Price Distribution</h4>
-              <ResponsiveContainer width="100%" height={140}>
-                <BarChart data={analytics.histogram} barCategoryGap="15%">
-                  <CartesianGrid horizontal vertical={false} stroke="#27272A" strokeDasharray="3 3" />
-                  <XAxis
-                    dataKey="label"
-                    tick={{ fontSize: 9, fill: '#71717A' }}
-                    axisLine={false}
-                    tickLine={false}
-                    interval="preserveStartEnd"
-                  />
-                  <YAxis
-                    tick={{ fontSize: 9, fill: '#71717A' }}
-                    axisLine={false}
-                    tickLine={false}
-                    width={20}
-                    allowDecimals={false}
-                  />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#3F3F46', border: '1px solid #52525B', borderRadius: '6px', fontSize: '11px' }}
-                    labelStyle={{ color: '#A1A1AA' }}
-                  />
-                  <Bar dataKey="sold" stackId="a" fill="#22C55E" opacity={0.6} radius={[0, 0, 0, 0]} name="Sold" />
-                  <Bar dataKey="active" stackId="a" fill="#3B82F6" opacity={0.6} radius={[2, 2, 0, 0]} name="Active" />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
+          {analyticsPanel}
 
-            {showConditionBreakdown && analytics.conditions.length > 1 && (
-              <ConditionBreakdown conditions={analytics.conditions} min={analytics.min} max={analytics.max} />
-            )}
-          </div>
+          {hasBaselineAnalytics && analytics && (
+            <>
+              <div className="flex flex-col lg:flex-row gap-4">
+                <div className="flex-1 min-w-0">
+                  <h4 className="text-xs text-zinc-500 mb-2">Price Distribution</h4>
+                  <ResponsiveContainer width="100%" height={140}>
+                    <BarChart data={analytics.histogram} barCategoryGap="15%">
+                      <CartesianGrid horizontal vertical={false} stroke="#27272A" strokeDasharray="3 3" />
+                      <XAxis
+                        dataKey="label"
+                        tick={{ fontSize: 9, fill: '#71717A' }}
+                        axisLine={false}
+                        tickLine={false}
+                        interval="preserveStartEnd"
+                      />
+                      <YAxis
+                        tick={{ fontSize: 9, fill: '#71717A' }}
+                        axisLine={false}
+                        tickLine={false}
+                        width={20}
+                        allowDecimals={false}
+                      />
+                      <Tooltip
+                        contentStyle={{ backgroundColor: '#3F3F46', border: '1px solid #52525B', borderRadius: '6px', fontSize: '11px' }}
+                        labelStyle={{ color: '#A1A1AA' }}
+                      />
+                      <Bar dataKey="sold" stackId="a" fill="#22C55E" opacity={0.6} radius={[0, 0, 0, 0]} name="Sold" />
+                      <Bar dataKey="active" stackId="a" fill="#3B82F6" opacity={0.6} radius={[2, 2, 0, 0]} name="Active" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
 
-          <div>
-            <h4 className="text-xs text-zinc-500 mb-2">Data Points</h4>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="text-zinc-500">
-                    <th className="text-left py-1 font-medium">Title</th>
-                    <th className="text-right py-1 font-medium w-16">Price</th>
-                    <th className="text-center py-1 font-medium w-14">Type</th>
-                    <th className="text-left py-1 font-medium w-20">Cond.</th>
-                    <th className="text-right py-1 font-medium w-20">Date</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-zinc-800/50">
-                  {prices.map((bp) => (
-                    <tr key={bp.id} className="hover:bg-raised transition-colors">
-                      <td className="py-1.5 pr-2 text-zinc-300 truncate max-w-[200px]">
-                        {bp.source_url ? (
-                          <a href={bp.source_url} target="_blank" rel="noopener noreferrer" className="hover:text-accent">{bp.title}</a>
-                        ) : bp.title}
-                      </td>
-                      <td className="py-1.5 text-right font-mono text-zinc-200">{formatPrice(bp.total_landed_gbp ?? bp.price)}</td>
-                      <td className="py-1.5 text-center">
-                        <span className={cn('text-tiny px-1 py-0.5 rounded', bp.source_type === 'sold' ? 'bg-success/10 text-success' : 'bg-info/10 text-info')}>
-                          {bp.source_type}
-                        </span>
-                      </td>
-                      <td className="py-1.5 text-zinc-500">{bp.condition || '—'}</td>
-                      <td className="py-1.5 text-right font-mono text-zinc-500">{bp.sold_date || formatRelativeTime(bp.observed_at)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
+                {showConditionBreakdown && analytics.conditions.length > 1 && (
+                  <ConditionBreakdown conditions={analytics.conditions} min={analytics.min} max={analytics.max} />
+                )}
+              </div>
+
+              <div>
+                <h4 className="text-xs text-zinc-500 mb-2">Data Points</h4>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-zinc-500">
+                        <th className="text-left py-1 font-medium">Title</th>
+                        <th className="text-right py-1 font-medium w-16">Price</th>
+                        <th className="text-center py-1 font-medium w-14">Type</th>
+                        <th className="text-left py-1 font-medium w-20">Cond.</th>
+                        <th className="text-right py-1 font-medium w-20">Date</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-800/50">
+                      {prices!.map((bp) => (
+                        <tr key={bp.id} className="hover:bg-raised transition-colors">
+                          <td className="py-1.5 pr-2 text-zinc-300 truncate max-w-[200px]">
+                            {bp.source_url ? (
+                              <a href={bp.source_url} target="_blank" rel="noopener noreferrer" className="hover:text-accent">{bp.title}</a>
+                            ) : bp.title}
+                          </td>
+                          <td className="py-1.5 text-right font-mono text-zinc-200">{formatPrice(bp.total_landed_gbp ?? bp.price)}</td>
+                          <td className="py-1.5 text-center">
+                            <span className={cn('text-tiny px-1 py-0.5 rounded', bp.source_type === 'sold' ? 'bg-success/10 text-success' : 'bg-info/10 text-info')}>
+                              {bp.source_type}
+                            </span>
+                          </td>
+                          <td className="py-1.5 text-zinc-500">{bp.condition || '—'}</td>
+                          <td className="py-1.5 text-right font-mono text-zinc-500">{bp.sold_date || formatRelativeTime(bp.observed_at)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

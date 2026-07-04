@@ -22,6 +22,9 @@ import EbayAuctionBlock from '@/components/source-specific/EbayAuctionBlock';
 import EbayConditionBadge from '@/components/source-specific/EbayConditionBadge';
 import ViewOnSourceLink from '@/components/source-specific/ViewOnSourceLink';
 import CarAttributesBlock from '@/components/source-specific/CarAttributesBlock';
+import MustHaveChips from '@/components/verticals/cars/MustHaveChips';
+import { parseCarAttributes, parseFeatures } from '@/lib/attributes';
+import type { CarAttributes, HuntTargetsData, TargetInfo } from '@shared/types';
 import {
   AreaChart,
   Area,
@@ -32,6 +35,51 @@ import {
   CartesianGrid,
   ReferenceLine,
 } from 'recharts';
+
+/** Case-insensitive "one contains the other" string match. */
+function ciContains(a: string | undefined, b: unknown): boolean {
+  if (!a || typeof b !== 'string' || b.trim() === '') return false;
+  const al = a.toLowerCase();
+  const bl = b.toLowerCase();
+  return al.includes(bl) || bl.includes(al);
+}
+
+/**
+ * Resolve which hunt target an offer belongs to, for the "Spec sheet →" link.
+ * Primary: parsed attributes make+model vs target criteria — exact model
+ * equality (case-insensitive) wins outright; otherwise a contains-match counts
+ * only when it is UNIQUE (overlapping model names like "EV6" / "EV6 GT" would
+ * otherwise resolve by target order). Fallback: the single target whose
+ * target_key appears in the offer title (case-insensitive). Returns the
+ * target_key, or null when unresolved/ambiguous.
+ */
+export function resolveOfferTarget(
+  attrs: CarAttributes,
+  title: string,
+  targets: TargetInfo[],
+): string | null {
+  const candidates = targets.filter((t) => {
+    const c = t.criteria;
+    return !!c && ciContains(attrs.make, c.make) && ciContains(attrs.model, c.model);
+  });
+
+  const model = attrs.model?.trim().toLowerCase();
+  if (model) {
+    const exact = candidates.find((t) => {
+      const cm = t.criteria?.model;
+      return typeof cm === 'string' && cm.trim().toLowerCase() === model;
+    });
+    if (exact) return exact.target_key;
+  }
+  if (candidates.length === 1) return candidates[0].target_key;
+  if (candidates.length > 1) return null; // ambiguous — no exact winner
+
+  const titleLower = title.toLowerCase();
+  const inTitle = targets.filter((t) =>
+    titleLower.includes(t.target_key.toLowerCase()),
+  );
+  return inTitle.length === 1 ? inTitle[0].target_key : null;
+}
 
 export default function OfferDetail() {
   const { id } = useParams();
@@ -55,6 +103,16 @@ export default function OfferDetail() {
   )?.hunt_id ?? offer?.hunt_associations?.[0]?.hunt_id ?? null;
 
   const { match, assess } = useBaseline(primaryHuntId);
+
+  // Cars offers: hunt targets for must-have chips + "Spec sheet →" link.
+  // Uses primaryHuntId (prefers non-dismissed associations) so the must-haves
+  // shown belong to the same hunt as the market context. Skips silently when
+  // the offer has no hunt associations.
+  const { data: targetsData } = useQuery({
+    queryKey: queryKeys.hunts.targets(primaryHuntId!),
+    queryFn: () => apiGet<HuntTargetsData>(`/hunts/${primaryHuntId}/targets`),
+    enabled: offer?.vertical === 'cars' && primaryHuntId != null,
+  });
 
   if (!offer) {
     return (
@@ -285,7 +343,36 @@ export default function OfferDetail() {
       {isEbayAuction && <EbayAuctionBlock offer={offer} />}
 
       {/* Car attributes — cars vertical only */}
-      {offer.vertical === 'cars' && <CarAttributesBlock attributes={offer.attributes ?? {}} />}
+      {offer.vertical === 'cars' && (
+        <CarAttributesBlock attributes={offer.attributes ?? {}} source={offer.source} />
+      )}
+
+      {/* Must-haves — cars vertical only, needs hunt targets */}
+      {offer.vertical === 'cars' && targetsData && targetsData.must_have.length > 0 && (() => {
+        const carAttrs = parseCarAttributes(offer.attributes ?? {});
+        const features = parseFeatures(offer.attributes ?? {});
+        const targetKey = resolveOfferTarget(carAttrs, offer.title, targetsData.targets);
+        return (
+          <div className="bg-surface border border-zinc-800 rounded-lg p-4 mb-6">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-heading text-zinc-300">Must-haves</h3>
+              {targetKey && primaryHuntId != null && (
+                <Link
+                  to={`/hunts/${primaryHuntId}/models/${encodeURIComponent(targetKey)}`}
+                  className="text-sm text-accent hover:underline"
+                >
+                  Spec sheet &rarr;
+                </Link>
+              )}
+            </div>
+            <MustHaveChips
+              mustHaves={targetsData.must_have}
+              features={features}
+              mode="full"
+            />
+          </div>
+        );
+      })()}
 
       {/* Market context — full width */}
       {segMatch && (
