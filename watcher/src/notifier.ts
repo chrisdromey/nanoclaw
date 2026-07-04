@@ -36,21 +36,32 @@ function writeIpcTask(taskId: string, prompt: string): void {
 }
 
 /**
- * Look up the evaluator skill for a vertical.
- * Falls back to 'listing-evaluation' if the vertical is missing or the loader fails.
+ * Look up the evaluator sub-agent name for a vertical (the `agent.name` block in verticals.yml).
+ * Falls back to 'generic-deal-evaluator' (always registered by the agent-runner) if the vertical
+ * is missing, has no agent block, or the loader fails.
  */
-function resolveEvaluatorSkill(vertical: string): string {
+function resolveEvaluatorAgent(vertical: string): string {
   try {
     const v = getVertical(vertical);
-    return v.evaluator_skill;
+    return v.agent?.name ?? 'generic-deal-evaluator';
   } catch (err) {
-    logger.warn({ vertical, err }, 'Could not load vertical config; falling back to listing-evaluation skill');
-    return 'listing-evaluation';
+    logger.warn({ vertical, err }, 'Could not load vertical config; falling back to generic-deal-evaluator agent');
+    return 'generic-deal-evaluator';
   }
 }
 
+/**
+ * Standard delegation coda for watcher-triggered evaluation prompts.
+ * The orchestrator has NO batch-triage tools (get_hunt_summary/list_offers/record_evaluation/
+ * batch_dismiss) — evaluation must run inside the named evaluator sub-agent, whose context is
+ * discarded when it returns. Keeps the long-lived main context small.
+ */
+const DELEGATION_RULES = [
+  'Do NOT evaluate listings yourself — batch triage tools are not available in this context.',
+  'If a named sub-agent is unavailable, report the failure to the user — do not attempt inline evaluation.',
+];
+
 function buildUrgentPrompt(huntName: string, changes: Change[], vertical: string): string {
-  const evaluatorSkill = resolveEvaluatorSkill(vertical);
   const lines: string[] = [`Deal Hunter Watcher Alert — Hunt: "${huntName}"`, ''];
 
   for (const change of changes) {
@@ -75,7 +86,13 @@ function buildUrgentPrompt(huntName: string, changes: Change[], vertical: string
     lines.push('');
   }
 
-  lines.push(`Use get_hunt_summary to review full context, then evaluate using the ${evaluatorSkill} skill.`);
+  const evaluatorAgent = resolveEvaluatorAgent(vertical);
+  lines.push(
+    `Spawn the "${evaluatorAgent}" sub-agent (Task tool) to assess the item(s) above — pass it the hunt name and the source IDs listed, ` +
+      'and instruct it to review context via get_hunt_summary, evaluate each item, record decisions with record_evaluation, ' +
+      'and return a short verdict per item. Relay its verdicts to the user.',
+  );
+  lines.push(...DELEGATION_RULES);
   return lines.join('\n');
 }
 
@@ -152,14 +169,23 @@ export function sendNewOffersNotification(
 
   lines.push('');
 
-  // Build per-vertical evaluator skill hint (if all hunts share one vertical, be specific)
-  const verticals = [...new Set(huntSummaries.map((h) => h.vertical ?? 'computers'))];
-  if (verticals.length === 1) {
-    const skill = resolveEvaluatorSkill(verticals[0]);
-    lines.push(`Call get_hunt_summary for each hunt to review and evaluate new offers using the ${skill} skill.`);
-  } else {
-    lines.push('Call get_hunt_summary for each hunt to review and evaluate new offers using the appropriate evaluator skill for each hunt\'s vertical.');
+  // Delegation instructions: one evaluator sub-agent per hunt. Evaluation never runs in the
+  // orchestrator's own context (see DELEGATION_RULES).
+  lines.push('Spawn each hunt\'s evaluator sub-agent with the Task tool (one Task per hunt, in parallel where possible):');
+  for (const h of huntSummaries) {
+    const agent = resolveEvaluatorAgent(h.vertical ?? 'computers');
+    lines.push(`• Hunt ${h.huntId} "${h.huntName}" → agent "${agent}" — triage the ${h.newCount} offers announced above.`);
   }
+  lines.push(
+    'In each sub-agent prompt include: the hunt id, the offer count to triage, and these instructions — ' +
+      'call get_hunt_summary for context, then list_offers (hunt_offer_status=new, oldest first, limit to the announced count), ' +
+      'evaluate against the hunt criteria, record every decision with record_evaluation or batch_dismiss, ' +
+      'and return a compact summary: alert/watch/dismiss counts plus a one-line reason per ALERT.',
+  );
+  lines.push(
+    'When each sub-agent returns: relay ALERT items to the user (link + price + one-line reason), then call log_hunt_run.',
+  );
+  lines.push(...DELEGATION_RULES);
 
   writeIpcTask(taskId, lines.join('\n'));
   logger.info({ taskId, huntCount: huntSummaries.length }, 'New offers notification sent via IPC');
@@ -168,7 +194,6 @@ export function sendNewOffersNotification(
 /** Price change notification for watched offers. */
 export function sendPriceChangeNotification(huntId: number, huntName: string, changes: Change[], vertical: string): void {
   const taskId = `watcher-price-${Date.now()}-${randomUUID().slice(0, 8)}`;
-  const evaluatorSkill = resolveEvaluatorSkill(vertical);
 
   const lines = [`Deal Hunter — Price change on watched offer — Hunt: "${huntName}"`, ''];
   for (const change of changes) {
@@ -179,7 +204,13 @@ export function sendPriceChangeNotification(huntId: number, huntName: string, ch
     lines.push(`  ${change.source ?? 'source'} ID: ${change.sourceId}`);
     lines.push('');
   }
-  lines.push(`Use get_hunt_summary to review context, then reassess using the ${evaluatorSkill} skill.`);
+  const evaluatorAgent = resolveEvaluatorAgent(vertical);
+  lines.push(
+    `Spawn the "${evaluatorAgent}" sub-agent (Task tool) to reassess the offer(s) above — pass it the hunt name and source IDs, ` +
+      'and instruct it to review context via get_hunt_summary, reassess each price change against the hunt criteria, ' +
+      'record decisions with record_evaluation, and return a short verdict per item. Relay its verdicts to the user.',
+  );
+  lines.push(...DELEGATION_RULES);
 
   writeIpcTask(taskId, lines.join('\n'));
   logger.info({ taskId, huntId, changeCount: changes.length }, 'Price change notification sent via IPC');

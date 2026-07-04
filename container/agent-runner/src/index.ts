@@ -451,7 +451,13 @@ If something fails, say so — don't retry silently. Say what went wrong and wha
   // DB. Adding a vertical with an `agent` block in config/verticals.yml adds its evaluator here
   // with no code change. market-researcher and generic-deal-evaluator stay hand-defined below.
   const evaluatorAgents = buildEvaluatorAgents(ebayAccessToken);
-  log(`Built ${Object.keys(evaluatorAgents).length} vertical evaluator agents: ${Object.keys(evaluatorAgents).join(', ') || '(none — is the watcher running?)'}`);
+  if (Object.keys(evaluatorAgents).length === 0) {
+    // Should be unreachable (buildEvaluatorAgents merges hand-defined fallbacks), but if it
+    // ever happens, delegation-only evaluation has no target agents and triage will fail.
+    log('ERROR: no evaluator agents registered — new-offer triage will fail (delegation-only, no inline fallback)');
+  } else {
+    log(`Built ${Object.keys(evaluatorAgents).length} vertical evaluator agents: ${Object.keys(evaluatorAgents).join(', ')}`);
+  }
 
   for await (const message of query({
     prompt: stream,
@@ -474,8 +480,7 @@ If something fails, say so — don't retry silently. Say what went wrong and wha
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
-        // Orchestrator tool scoping (reduce tool bloat):
-        // - deal-hunter-db: always needed (hunt/offer state, routing, dispatch).
+        // Orchestrator tool scoping (reduce tool bloat AND context bloat):
         // - eBay tools (ebay-api/ebay-search/sold-data): kept because orchestrator-level
         //   skills run them INLINE — requirements-discovery & hunt-management do eBay market
         //   recon via ebay-search; /research uses ebay-api/ebay-search/sold-data directly.
@@ -483,10 +488,43 @@ If something fails, say so — don't retry silently. Say what went wrong and wha
         //   sub-agent (cars-evaluator, market-researcher), so the orchestrator never calls it
         //   directly. The server is still defined in mcpServers below so those sub-agents can
         //   reference it by name.
+        // - deal-hunter-db: explicit subset, NOT the wildcard. Batch-triage tools
+        //   (get_hunt_summary, list_offers, record_evaluation, batch_dismiss, update_offer)
+        //   are deliberately absent: offer evaluation must run inside evaluator sub-agents
+        //   (which grant mcp__deal-hunter-db__* themselves), never in this long-lived main
+        //   context — inline triage was the biggest token sink in the Jun 2026 burn incident.
+        //   Single-item deep dives (get_offer, get_offer_history) stay available here for
+        //   interactive chat; they're bounded, unlike batch scans.
         'mcp__ebay-api__*',
         'mcp__ebay-search__*',
-        'mcp__deal-hunter-db__*',
         'mcp__sold-data__*',
+        // hunt lifecycle + dispatch
+        'mcp__deal-hunter-db__list_verticals',
+        'mcp__deal-hunter-db__get_vertical',
+        'mcp__deal-hunter-db__manage_hunt',
+        'mcp__deal-hunter-db__get_hunt',
+        'mcp__deal-hunter-db__mark_hunt_reviewed',
+        'mcp__deal-hunter-db__log_hunt_run',
+        'mcp__deal-hunter-db__get_hunt_history',
+        // bounded single-item lookups (progressive disclosure, not batch triage)
+        'mcp__deal-hunter-db__record_offer',
+        'mcp__deal-hunter-db__get_offer',
+        'mcp__deal-hunter-db__get_offer_history',
+        // alerts + market context
+        'mcp__deal-hunter-db__record_alert',
+        'mcp__deal-hunter-db__record_alert_response',
+        'mcp__deal-hunter-db__get_market_overview',
+        'mcp__deal-hunter-db__get_prices',
+        'mcp__deal-hunter-db__record_search',
+        'mcp__deal-hunter-db__search_evaluations',
+        // baselining + provenance gate
+        'mcp__deal-hunter-db__create_market_segment',
+        'mcp__deal-hunter-db__record_baseline_price',
+        'mcp__deal-hunter-db__get_baseline_summary',
+        'mcp__deal-hunter-db__recompute_segment_prices',
+        'mcp__deal-hunter-db__record_kb_coverage',
+        'mcp__deal-hunter-db__record_claim_verification',
+        'mcp__deal-hunter-db__waive_must_have',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',

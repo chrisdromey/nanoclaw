@@ -89,18 +89,19 @@ describe('sendUrgentNotification', () => {
     expect(prompt).toContain('autotrader ID: advert-999');
   });
 
-  it('references listing-evaluation skill for computers vertical', () => {
+  it('instructs delegation to the vertical evaluator agent for computers', () => {
     sendUrgentNotification(1, 'PC Hunt', [makeChange()], 'computers');
     const prompt = captureLastPrompt();
 
-    expect(prompt).toContain('listing-evaluation skill');
+    expect(prompt).toContain('Spawn the "deal-evaluator" sub-agent');
+    expect(prompt).toContain('Do NOT evaluate listings yourself');
   });
 
-  it('falls back to listing-evaluation for unknown vertical', () => {
+  it('falls back to generic-deal-evaluator agent for unknown vertical', () => {
     sendUrgentNotification(1, 'Mystery Hunt', [makeChange()], 'nonexistent-vertical');
     const prompt = captureLastPrompt();
 
-    expect(prompt).toContain('listing-evaluation skill');
+    expect(prompt).toContain('Spawn the "generic-deal-evaluator" sub-agent');
   });
 });
 
@@ -116,23 +117,36 @@ describe('sendNewOffersNotification', () => {
     writeSpy.mockRestore();
   });
 
-  it('references evaluator skill for computers vertical', () => {
+  it('instructs per-hunt delegation to the vertical evaluator agent', () => {
     sendNewOffersNotification([
       { huntId: 1, huntName: 'PC Hunt', newCount: 5, hasBaseline: true, vertical: 'computers' },
     ]);
     const prompt = captureLastPrompt();
 
-    expect(prompt).toContain('listing-evaluation skill');
+    expect(prompt).toContain('Hunt 1 "PC Hunt" → agent "deal-evaluator" — triage the 5 offers');
+    expect(prompt).toContain('Do NOT evaluate listings yourself');
+    expect(prompt).toContain('do not attempt inline evaluation');
   });
 
-  it('uses generic message for mixed verticals', () => {
+  it('lists one delegation line per hunt for mixed verticals', () => {
     sendNewOffersNotification([
       { huntId: 1, huntName: 'PC Hunt', newCount: 2, hasBaseline: true, vertical: 'computers' },
       { huntId: 2, huntName: 'Car Hunt', newCount: 1, hasBaseline: false, vertical: 'cars' },
     ]);
     const prompt = captureLastPrompt();
 
-    expect(prompt).toContain('appropriate evaluator skill');
+    expect(prompt).toContain('agent "deal-evaluator"');
+    expect(prompt).toContain('agent "cars-evaluator"');
+  });
+
+  it('announces "X of Y pending" when pendingCount exceeds the batch', () => {
+    sendNewOffersNotification([
+      { huntId: 1, huntName: 'PC Hunt', newCount: 40, pendingCount: 90, hasBaseline: true, vertical: 'computers' },
+    ]);
+    const prompt = captureLastPrompt();
+
+    expect(prompt).toContain('40 of 90 pending new offers');
+    expect(prompt).toContain('triage only these 40');
   });
 
   it('shows baseline warning when hasBaseline is false', () => {
@@ -157,7 +171,7 @@ describe('sendPriceChangeNotification', () => {
     writeSpy.mockRestore();
   });
 
-  it('includes source id and references evaluator skill', () => {
+  it('includes source id and instructs evaluator-agent delegation', () => {
     sendPriceChangeNotification(1, 'PC Hunt', [
       {
         type: 'price_drop',
@@ -172,7 +186,7 @@ describe('sendPriceChangeNotification', () => {
     const prompt = captureLastPrompt();
 
     expect(prompt).toContain('ebay ID: v1|789|0');
-    expect(prompt).toContain('listing-evaluation skill');
+    expect(prompt).toContain('Spawn the "deal-evaluator" sub-agent');
     expect(prompt).not.toContain('eBay ID:');
   });
 });

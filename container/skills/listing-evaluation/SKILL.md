@@ -12,16 +12,13 @@ description: >
 
 ## Delegation
 
-When this skill is triggered from an interactive chat session (user message, not a scheduled task), delegate to the `deal-evaluator` sub-agent instead of doing the work inline. This keeps the chat context lean.
+Evaluation ALWAYS runs in the `deal-evaluator` sub-agent — scheduled/watcher runs and interactive chat alike. The orchestrator (main session) does not have the batch-triage tools (`get_hunt_summary`, `list_offers`, `record_evaluation`, `batch_dismiss`, `update_offer`), so delegation is the only path; it also keeps the long-lived main context lean, which is the point — inline triage was the biggest token sink on record.
 
-1. Gather context: hunt ID, what to evaluate (new offers / specific listing / broad check)
-2. Delegate to `deal-evaluator` with that context
-3. Relay the returned summary to the user
+1. Gather context: hunt ID, what to evaluate (new offers / specific listing / broad check), and the batch size if the notification announced one ("X of Y pending — triage only these X")
+2. Delegate to `deal-evaluator` with that context (one Task per hunt; parallel Tasks for multiple hunts)
+3. Relay the returned summary to the user, then call `log_hunt_run`
 
-Do NOT delegate when:
-- You ARE the `deal-evaluator` sub-agent (this skill was preloaded via `skills`)
-- This is a scheduled/watcher invocation (`[SCHEDULED TASK]` or `[WATCHER]` prefix in prompt)
-- Trivial lookup (single field check, no search needed)
+The ONLY time you follow the evaluation procedure below yourself is when you ARE the `deal-evaluator` sub-agent (this skill was preloaded via `skills`). For a trivial single-offer question in chat, `get_offer` / `get_offer_history` are available to the orchestrator — use those instead of spawning an evaluator.
 
 ## When to use
 
