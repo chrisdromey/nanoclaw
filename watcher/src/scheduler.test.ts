@@ -43,13 +43,18 @@ vi.mock('./config.js', () => ({
   WATCH_CADENCE_MS: 7_200_000,
   STALENESS_SWEEP_CADENCE_MS: 14_400_000,
   STALE_OFFER_HOURS: 24,
+  STALE_QUEUE_DAYS: 7,
+  MAX_TRIAGE_BATCH_PER_RUN: 40,
+  TRIAGE_DRAIN_CADENCE_MS: 1_800_000,
   EBAY_CLIENT_ID: 'id',
   EBAY_CLIENT_SECRET: 'secret',
   AUCTION_THRESHOLDS: [24, 12, 6],
 }));
 
+const mockSendNewOffers = vi.fn();
+
 vi.mock('./notifier.js', () => ({
-  sendNewOffersNotification: vi.fn(),
+  sendNewOffersNotification: (...args: unknown[]) => mockSendNewOffers(...args),
   sendUrgentNotification: vi.fn(),
   sendPriceChangeNotification: vi.fn(),
 }));
@@ -164,6 +169,9 @@ function makeState(): SchedulerState {
     dailyApiCallsResetAt: Date.now() + 86_400_000,
     consecutiveFailures: new Map(),
     sourcePausedAt: new Map(),
+    // Defaults keep drain/flush inert for dispatch tests; triage tests override.
+    lastDrainTime: Date.now(),
+    lastQueueFlushTime: Date.now(),
   };
 }
 
@@ -698,5 +706,127 @@ describe('Scheduler dispatch', () => {
 
     // Adapter should NOT be called — no translator means skip
     expect(atSearchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('Triage queue management (backlog cap / stale flush / drain)', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db = makeTestDb();
+    mockGetTranslator.mockReturnValue((_hunt: unknown, terms: string) => ({ terms }));
+  });
+
+  function seedHunt(): number {
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
+      VALUES ('Backlog Hunt', '["thinkcentre"]', 0, '["ebay"]', 'computers')
+    `).run();
+    return (db.prepare('SELECT id FROM hunts').get() as { id: number }).id;
+  }
+
+  /** Insert an offer + hunt_offers association with a given queue age (days). */
+  function seedQueuedOffer(huntId: number, sourceId: string, ageDays: number): void {
+    db.prepare(`
+      INSERT INTO offers (source, source_id, title, url) VALUES ('ebay', ?, 'Item ' || ?, 'https://x/' || ?)
+    `).run(sourceId, sourceId, sourceId);
+    const offerId = (db.prepare('SELECT id FROM offers WHERE source_id = ?').get(sourceId) as { id: number }).id;
+    db.prepare(`
+      INSERT INTO hunt_offers (hunt_id, offer_id, status, first_associated_at)
+      VALUES (?, ?, 'new', datetime('now', '-' || ? || ' days'))
+    `).run(huntId, offerId, ageDays);
+  }
+
+  function idleAdapter() {
+    const search = vi.fn().mockResolvedValue({ listings: [], apiCalls: 1, errors: [] });
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'ebay',
+      search,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: true, richSearch: true, needsDetailFetch: false },
+      minIntervalMs: 0,
+    });
+    return search;
+  }
+
+  it('auto-dismisses queued offers older than STALE_QUEUE_DAYS on first tick, keeps fresh ones', async () => {
+    const huntId = seedHunt();
+    seedQueuedOffer(huntId, 'old-1', 10);
+    seedQueuedOffer(huntId, 'old-2', 8);
+    seedQueuedOffer(huntId, 'fresh-1', 2);
+    idleAdapter();
+
+    const state = makeState();
+    state.lastQueueFlushTime = 0; // startup condition
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+
+    const statuses = db
+      .prepare('SELECT o.source_id as sid, ho.status FROM hunt_offers ho JOIN offers o ON o.id = ho.offer_id')
+      .all() as Array<{ sid: string; status: string }>;
+    const byId = Object.fromEntries(statuses.map((r) => [r.sid, r.status]));
+    expect(byId['old-1']).toBe('dismissed');
+    expect(byId['old-2']).toBe('dismissed');
+    expect(byId['fresh-1']).toBe('new');
+    expect(state.lastQueueFlushTime).toBeGreaterThan(0);
+  });
+
+  it('caps announced offers at MAX_TRIAGE_BATCH_PER_RUN with pendingCount for the rest', async () => {
+    seedHunt();
+    // Adapter returns 50 new listings in one tick
+    const listings = Array.from({ length: 50 }, (_, i) => makeListing(`bulk|${i}`));
+    const search = vi.fn().mockResolvedValue({ listings, apiCalls: 1, errors: [] });
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'ebay',
+      search,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: true, richSearch: true, needsDetailFetch: false },
+      minIntervalMs: 0,
+    });
+
+    const state = makeState();
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+
+    expect(mockSendNewOffers).toHaveBeenCalledTimes(1);
+    const summaries = mockSendNewOffers.mock.calls[0][0];
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0].newCount).toBe(40);
+    expect(summaries[0].pendingCount).toBe(50);
+    expect(summaries[0].newListings).toHaveLength(40);
+  });
+
+  it('drains the remaining backlog on a later tick when no fresh offers arrive', async () => {
+    const huntId = seedHunt();
+    // 10 queued offers left over from an earlier capped batch (fresh enough to keep)
+    for (let i = 0; i < 10; i++) seedQueuedOffer(huntId, `left|${i}`, 1);
+    idleAdapter(); // no new listings this tick
+
+    const state = makeState();
+    state.lastDrainTime = 0; // drain cadence elapsed
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+
+    expect(mockSendNewOffers).toHaveBeenCalledTimes(1);
+    const summaries = mockSendNewOffers.mock.calls[0][0];
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0].newCount).toBe(10);
+    expect(summaries[0].pendingCount).toBe(10);
+    expect(state.lastDrainTime).toBeGreaterThan(0);
+  });
+
+  it('does not drain before the drain cadence elapses', async () => {
+    const huntId = seedHunt();
+    seedQueuedOffer(huntId, 'wait|1', 1);
+    idleAdapter();
+
+    const state = makeState(); // lastDrainTime = now → cadence not elapsed
+    const { tick } = await import('./scheduler.js');
+    await tick(state, db);
+
+    expect(mockSendNewOffers).not.toHaveBeenCalled();
   });
 });

@@ -492,6 +492,31 @@ export function getWatchedOffers(db: Database.Database): Offer[] {
   return db.prepare("SELECT * FROM offers WHERE watching = 1 AND status = 'active'").all() as Offer[];
 }
 
+/** Count queued-for-triage offers (hunt_offers.status='new') for a hunt. */
+export function countNewHuntOffers(db: Database.Database, huntId: number): number {
+  const row = db
+    .prepare("SELECT COUNT(*) as count FROM hunt_offers WHERE hunt_id = ? AND status = 'new'")
+    .get(huntId) as { count: number };
+  return row.count;
+}
+
+/**
+ * Auto-dismiss queued (status='new') hunt offers older than `days`.
+ * Token-burn protection: after a long watcher outage the triage backlog is mostly
+ * dead listings; dismissing them prevents a single agent run from being asked to
+ * evaluate weeks of history. Returns the number of rows dismissed.
+ */
+export function dismissStaleHuntOffers(db: Database.Database, days: number): number {
+  const result = db
+    .prepare(
+      `UPDATE hunt_offers SET status = 'dismissed'
+       WHERE status = 'new'
+         AND datetime(first_associated_at) < datetime('now', '-' || ? || ' days')`,
+    )
+    .run(days);
+  return result.changes;
+}
+
 export function getStaleOffers(db: Database.Database, staleHours: number): Offer[] {
   return db
     .prepare(

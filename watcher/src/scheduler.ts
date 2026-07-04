@@ -17,6 +17,9 @@ import {
   WATCH_CADENCE_MS,
   STALENESS_SWEEP_CADENCE_MS,
   STALE_OFFER_HOURS,
+  STALE_QUEUE_DAYS,
+  MAX_TRIAGE_BATCH_PER_RUN,
+  TRIAGE_DRAIN_CADENCE_MS,
 } from './config.js';
 import { getAdapter, hasAdapter } from './sources/index.js';
 import { isAuthError, invalidateToken } from './sources/ebay/auth.js';
@@ -26,6 +29,8 @@ import {
   getActiveHunts,
   getWatchedOffers,
   getStaleOffers,
+  countNewHuntOffers,
+  dismissStaleHuntOffers,
   getLastSearchTime,
   getHunt,
   getHuntIdsForOffer,
@@ -81,6 +86,15 @@ export interface SchedulerState {
    * Format: `${huntId}:${sourceId}:${terms}` → epoch ms. Cleared on success.
    */
   sourcePausedAt: Map<string, number>;
+  /**
+   * Last time a new-offers triage notification was sent (fresh or drain).
+   * Gates the backlog drain: when no fresh offers arrive but hunts still have
+   * queued status='new' offers (left over from a capped batch), a drain
+   * notification is sent every TRIAGE_DRAIN_CADENCE_MS until the queue empties.
+   */
+  lastDrainTime: number;
+  /** Last time the stale-queue flush ran (dismisses status='new' rows older than STALE_QUEUE_DAYS). */
+  lastQueueFlushTime: number;
 }
 
 function nextMidnight(): number {
@@ -107,6 +121,8 @@ export function initState(db: Database.Database): SchedulerState {
     dailyApiCallsResetAt: nextMidnight(),
     consecutiveFailures: new Map(),
     sourcePausedAt: new Map(),
+    lastDrainTime: Date.now(), // defer first drain — fresh-offer flow handles the first batch
+    lastQueueFlushTime: 0,     // flush stale queue on the first tick (covers restart-after-gap)
   };
 
   const hunts = getActiveHunts(db);
@@ -231,6 +247,21 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
   if (Date.now() > state.dailyApiCallsResetAt) {
     state.dailyApiCalls = new Map();
     state.dailyApiCallsResetAt = nextMidnight();
+  }
+
+  // --- Stale triage-queue flush ---
+  // Runs on the first tick after startup (lastQueueFlushTime starts at 0), so a
+  // restart after a long outage dismisses the dead backlog BEFORE any announcement,
+  // then periodically. Cheap single UPDATE — the sweep cadence is reused for pacing.
+  if (Date.now() - state.lastQueueFlushTime >= STALENESS_SWEEP_CADENCE_MS) {
+    const dismissed = dismissStaleHuntOffers(db, STALE_QUEUE_DAYS);
+    if (dismissed > 0) {
+      logger.info(
+        { dismissed, staleQueueDays: STALE_QUEUE_DAYS },
+        'Auto-dismissed stale queued offers (older than threshold, never triaged)',
+      );
+    }
+    state.lastQueueFlushTime = Date.now();
   }
 
   // --- Search polls (batch new offer notifications across the tick) ---
@@ -421,18 +452,66 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
     }
   }
 
-  // Send batched new-offer notification (one per tick, not per search term)
+  // Send batched new-offer notification (one per tick, not per search term).
+  // Capped at MAX_TRIAGE_BATCH_PER_RUN offers summed across hunts: a single agent
+  // triage run is never asked to evaluate more. The remainder stays
+  // hunt_offers.status='new' and is announced by the drain below on later ticks.
   if (newOffersByHunt.size > 0) {
-    sendNewOffersNotification(
-      Array.from(newOffersByHunt.entries()).map(([huntId, { huntName, newCount, vertical, newListings }]) => ({
+    const summaries: Parameters<typeof sendNewOffersNotification>[0] = [];
+    let budget = MAX_TRIAGE_BATCH_PER_RUN;
+    for (const [huntId, { huntName, vertical, newListings }] of newOffersByHunt.entries()) {
+      if (budget <= 0) {
+        logger.info({ huntId, cap: MAX_TRIAGE_BATCH_PER_RUN }, 'Triage batch cap reached — remaining hunts will drain on later ticks');
+        break;
+      }
+      // Pending includes any backlog left from earlier capped runs, not just this tick's finds.
+      const pending = countNewHuntOffers(db, huntId);
+      if (pending === 0) continue;
+      const announce = Math.min(pending, budget);
+      budget -= announce;
+      summaries.push({
         huntId,
         huntName,
-        newCount,
         vertical,
-        newListings,
+        newCount: announce,
+        pendingCount: pending,
+        newListings: newListings.slice(0, announce),
         hasBaseline: getSegmentCount(db, huntId) > 0,
-      })),
-    );
+      });
+    }
+    if (summaries.length > 0) {
+      sendNewOffersNotification(summaries);
+      state.lastDrainTime = Date.now();
+    }
+  } else if (Date.now() - state.lastDrainTime >= TRIAGE_DRAIN_CADENCE_MS) {
+    // --- Backlog drain ---
+    // No fresh offers this tick, but earlier capped batches may have left queued
+    // status='new' offers. Announce them in capped batches until the queue empties.
+    const summaries: Parameters<typeof sendNewOffersNotification>[0] = [];
+    let budget = MAX_TRIAGE_BATCH_PER_RUN;
+    for (const hunt of hunts) {
+      if (budget <= 0) break;
+      const pending = countNewHuntOffers(db, hunt.id);
+      if (pending === 0) continue;
+      const announce = Math.min(pending, budget);
+      budget -= announce;
+      summaries.push({
+        huntId: hunt.id,
+        huntName: hunt.name,
+        vertical: hunt.vertical,
+        newCount: announce,
+        pendingCount: pending,
+        hasBaseline: getSegmentCount(db, hunt.id) > 0,
+      });
+    }
+    if (summaries.length > 0) {
+      logger.info(
+        { hunts: summaries.length, announced: MAX_TRIAGE_BATCH_PER_RUN - budget },
+        'Draining queued new-offer backlog',
+      );
+      sendNewOffersNotification(summaries);
+    }
+    state.lastDrainTime = Date.now();
   }
 
   // --- Watch polls ---

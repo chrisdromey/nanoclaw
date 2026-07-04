@@ -94,6 +94,12 @@ export function sendNewOffersNotification(
     newCount: number;
     hasBaseline: boolean;
     vertical?: string;
+    /**
+     * Total queued (status='new') offers for this hunt, including backlog beyond
+     * this batch. When greater than newCount, the announcement says "X of Y pending"
+     * so the agent knows the rest arrives in later batches (and must not go looking).
+     */
+    pendingCount?: number;
     /** Optional: new listings to preview using the per-vertical formatter. */
     newListings?: FormattableListing[];
   }>,
@@ -102,7 +108,11 @@ export function sendNewOffersNotification(
 
   const lines = ['Deal Hunter — New offers found', ''];
   for (const h of huntSummaries) {
-    lines.push(`• Hunt "${h.huntName}" (ID ${h.huntId}): ${h.newCount} new offer${h.newCount > 1 ? 's' : ''}`);
+    const countLabel =
+      h.pendingCount && h.pendingCount > h.newCount
+        ? `${h.newCount} of ${h.pendingCount} pending new offers (rest follows in later batches — triage only these ${h.newCount})`
+        : `${h.newCount} new offer${h.newCount > 1 ? 's' : ''}`;
+    lines.push(`• Hunt "${h.huntName}" (ID ${h.huntId}): ${countLabel}`);
 
     // If a per-vertical formatter is configured and listings are available, render previews.
     if (h.newListings && h.newListings.length > 0) {

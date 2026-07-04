@@ -39,6 +39,11 @@ export const DB_PATH = path.join(PROJECT_ROOT, 'groups/telegram_main/deal-hunter
 export const IPC_DIR = path.join(PROJECT_ROOT, 'data/ipc/telegram_main');
 export const CHAT_JID = process.env.CHAT_JID || 'tg:6767009477';
 
+function intFromEnv(name: string, fallback: number): number {
+  const n = parseInt(process.env[name] ?? '', 10);
+  return isNaN(n) ? fallback : n;
+}
+
 // Timing
 export const SCHEDULER_TICK_MS = 30_000;         // Check hunts every 30s
 export const TOKEN_REFRESH_MS = 5_400_000;        // Refresh OAuth token every 90min
@@ -48,3 +53,15 @@ export const STALENESS_SWEEP_CADENCE_MS = 4 * 60 * 60_000; // Sweep stale offers
 export const STALE_OFFER_HOURS = 24;              // Offers unseen for 24h are considered stale
 export const DAILY_API_BUDGET = 4500;             // Stop at 4500 (limit is 5000/day)
 export const SEARCH_LIMIT_PER_FORMAT = 50;
+
+// New-offer triage queue management (token-burn protection).
+// Queued (hunt_offers.status='new') offers older than this are auto-dismissed as stale —
+// after a long watcher outage the backlog is mostly dead listings, and triaging weeks of
+// history in one agent run is the single biggest token sink we've observed.
+export const STALE_QUEUE_DAYS = intFromEnv('STALE_QUEUE_DAYS', 7);
+// Hard cap on how many queued offers a single agent triage run is asked to evaluate,
+// summed across all hunts in one notification. The remainder stays status='new' and
+// drains on subsequent ticks.
+export const MAX_TRIAGE_BATCH_PER_RUN = intFromEnv('MAX_TRIAGE_BATCH_PER_RUN', 40);
+// How often to check for (and announce) a leftover backlog when no fresh offers arrived.
+export const TRIAGE_DRAIN_CADENCE_MS = intFromEnv('TRIAGE_DRAIN_CADENCE_MINUTES', 30) * 60_000;
