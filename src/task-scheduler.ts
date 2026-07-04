@@ -1,6 +1,8 @@
+import Database from 'better-sqlite3';
 import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
+import path from 'path';
 
 import {
   ASSISTANT_NAME,
@@ -94,6 +96,63 @@ function skipStaleTask(task: ScheduledTask, overdueMs: number): void {
     },
     'Skipping stale task missed during downtime',
   );
+}
+
+/**
+ * Deal Hunter pause gate.
+ *
+ * Scheduled tasks have no hunt_id column — hunt linkage lives only in the prompt text
+ * (agent-created daily-review tasks embed "Hunt DB ID: N" / "hunt_id=N"). Pausing a hunt
+ * does NOT pause its cron tasks, so without this gate a paused hunt keeps burning agent
+ * runs on daily reviews. The gate reads the group's deal-hunter.db READ-ONLY just before
+ * dispatch:
+ *
+ * - Per-hunt task (prompt names hunt id(s)): skip unless at least one named hunt is
+ *   status='active' AND monitoring=1.
+ * - Generic deal-hunter task (id/prompt mentions deal-hunter, no hunt id): skip when the
+ *   group has zero active monitored hunts.
+ * - Anything else (non-deal-hunter tasks, missing DB, query error): fail OPEN — never
+ *   block unrelated groups or tasks on this gate.
+ *
+ * Returns a human-readable skip reason, or null to run the task.
+ */
+export function shouldSkipDealHunterTask(task: ScheduledTask): string | null {
+  const huntIds = new Set<number>();
+  for (const re of [/Hunt DB ID:\s*(\d+)/gi, /hunt_id=(\d+)/gi]) {
+    for (const m of task.prompt.matchAll(re)) huntIds.add(parseInt(m[1], 10));
+  }
+  const isGenericDealHunter =
+    huntIds.size === 0 && /deal[- ]hunter/i.test(`${task.id} ${task.prompt}`);
+  if (huntIds.size === 0 && !isGenericDealHunter) return null;
+
+  let db: InstanceType<typeof Database> | undefined;
+  try {
+    const dbPath = path.join(resolveGroupFolderPath(task.group_folder), 'deal-hunter.db');
+    db = new Database(dbPath, { readonly: true, fileMustExist: true });
+
+    if (huntIds.size > 0) {
+      const stmt = db.prepare('SELECT status, monitoring FROM hunts WHERE id = ?');
+      const states: string[] = [];
+      for (const id of huntIds) {
+        const hunt = stmt.get(id) as { status: string; monitoring: number } | undefined;
+        if (hunt && hunt.status === 'active' && hunt.monitoring === 1) return null;
+        states.push(`hunt ${id}: ${hunt ? hunt.status : 'not found'}`);
+      }
+      return `no referenced hunt is active+monitored (${states.join(', ')})`;
+    }
+
+    const active = db
+      .prepare("SELECT COUNT(*) as count FROM hunts WHERE status = 'active' AND monitoring = 1")
+      .get() as { count: number };
+    if (active.count === 0) return 'no active monitored hunts';
+    return null;
+  } catch (err) {
+    // Fail open: a missing/unreadable deal-hunter.db must never block a task.
+    logger.debug({ taskId: task.id, err }, 'Deal-hunter gate could not read hunt state; running task');
+    return null;
+  } finally {
+    db?.close();
+  }
 }
 
 export interface SchedulerDependencies {
@@ -307,6 +366,21 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           : 0;
         if (overdueMs > STALE_TASK_GRACE_MS) {
           skipStaleTask(currentTask, overdueMs);
+          continue;
+        }
+
+        // Deal Hunter pause gate: paused/closed hunts must not burn agent runs.
+        const gateReason = shouldSkipDealHunterTask(currentTask);
+        if (gateReason) {
+          updateTaskAfterRun(
+            currentTask.id,
+            computeNextRun(currentTask),
+            `Skipped: ${gateReason}`,
+          );
+          logger.info(
+            { taskId: currentTask.id, reason: gateReason },
+            'Skipping deal-hunter task (hunt paused/inactive)',
+          );
           continue;
         }
 
