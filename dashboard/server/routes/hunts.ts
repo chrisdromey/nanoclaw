@@ -1,6 +1,25 @@
 import { Hono } from 'hono';
 import { getDealDb } from '../db.js';
 import { checkOfferStatusBySource } from '../sources/index.js';
+import { evaluateActivationGate, type HuntRow } from '../deal-hunter-gate.js';
+import { computeReadiness } from '../hunt-readiness.js';
+
+// Shared subquery fragment: provenance-gate readiness counts (segments, KB coverage, verifications).
+const READINESS_COUNTS_SQL = `
+        (SELECT COUNT(*) FROM market_segments ms WHERE ms.hunt_id = h.id) as segment_count,
+        (SELECT COUNT(*) FROM knowledge_base kb WHERE kb.hunt_id = h.id) as kb_count,
+        (SELECT COUNT(*) FROM claim_verifications cv WHERE cv.hunt_id = h.id AND cv.verdict = 'verified') as verified_count`;
+
+function readinessFor(h: Record<string, unknown>) {
+  return computeReadiness(
+    { status: h.status as string, criteria: h.criteria as string, gate_version: h.gate_version as number | null },
+    {
+      segment_count: (h.segment_count as number) ?? 0,
+      kb_count: (h.kb_count as number) ?? 0,
+      verified_count: (h.verified_count as number) ?? 0,
+    },
+  );
+}
 
 function parseJsonField<T>(value: string | null | undefined, fallback: T): T {
   if (!value) return fallback;
@@ -28,7 +47,9 @@ huntRoutes.get('/hunts', (c) => {
   else if (status === 'closed') conditions.push("h.status = 'closed'");
   else if (status === 'paused') conditions.push("h.status = 'paused'");
   else if (status === 'active') conditions.push("h.status = 'active'");
-  else conditions.push("h.status IN ('active', 'paused')");
+  else if (status === 'draft') conditions.push("h.status = 'draft'");
+  // Default view includes drafts so a hunt stuck pre-activation is visible, not silently missing.
+  else conditions.push("h.status IN ('draft', 'active', 'paused')");
 
   if (vertical) conditions.push(`h.vertical = '${vertical.replace(/'/g, "''")}'`);
 
@@ -40,10 +61,10 @@ huntRoutes.get('/hunts', (c) => {
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'new') as new_count,
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'evaluated') as evaluated_count,
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'watching') as watching_count,
-        (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'dismissed') as dismissed_count
+        (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'dismissed') as dismissed_count,${READINESS_COUNTS_SQL}
       FROM hunts h
       ${whereClause}
-      ORDER BY CASE h.status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 WHEN 'closed' THEN 2 END, h.created_at DESC`,
+      ORDER BY CASE h.status WHEN 'draft' THEN 0 WHEN 'active' THEN 1 WHEN 'paused' THEN 2 WHEN 'closed' THEN 3 END, h.created_at DESC`,
     )
     .all();
 
@@ -88,6 +109,9 @@ huntRoutes.get('/hunts', (c) => {
     return {
       ...h,
       sources: parseJsonField(h.sources as string | null, defaultSources(h.vertical)),
+      // Provenance-gate readiness: a non-closed hunt still blocked by the gate surfaces why —
+      // needs_baselining (no segments), and for v2 feature-led hunts needs_kb / needs_verification.
+      ...readinessFor(h),
       min_price: prices?.min_price ?? null,
       max_price: prices?.max_price ?? null,
       last_searched: search?.last_searched ?? null,
@@ -110,14 +134,18 @@ huntRoutes.get('/hunts/:id', (c) => {
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'new') as new_count,
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'evaluated') as evaluated_count,
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'watching') as watching_count,
-        (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'dismissed') as dismissed_count
+        (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'dismissed') as dismissed_count,${READINESS_COUNTS_SQL}
       FROM hunts h WHERE h.id = ?`,
     )
     .get(id);
 
   if (!hunt) return c.json({ error: 'Hunt not found' }, 404);
   const h = hunt as Record<string, unknown>;
-  return c.json({ ...h, sources: parseJsonField(h.sources as string | null, defaultSources(h.vertical)) });
+  return c.json({
+    ...h,
+    sources: parseJsonField(h.sources as string | null, defaultSources(h.vertical)),
+    ...readinessFor(h),
+  });
 });
 
 // Offers for a hunt, filtered by pipeline status
@@ -226,8 +254,20 @@ huntRoutes.put('/hunts/:id', async (c) => {
     params.push(body.category_ids);
   }
   if (body.monitoring !== undefined) {
+    // Mirror the MCP `update`: monitoring can never be turned ON here — that must go through the
+    // activation gate (resume/activate), which verifies valid criteria + at least one market
+    // segment. Only an explicit `false` (stop monitoring) is honoured.
+    if (body.monitoring === true || body.monitoring === 1) {
+      return c.json(
+        {
+          error:
+            'Cannot enable monitoring via update — use resume/activate, which verifies the hunt has valid criteria and at least one market segment.',
+        },
+        400,
+      );
+    }
     sets.push('monitoring = ?');
-    params.push(body.monitoring ? 1 : 0);
+    params.push(0);
   }
 
   if (sets.length === 0) {
@@ -243,14 +283,16 @@ huntRoutes.put('/hunts/:id', async (c) => {
   return c.json(updated);
 });
 
-// Pause hunt
+// Pause hunt — mirrors the MCP `pause`: also clears monitoring so the watcher stops polling it
+// (getActiveHunts requires status='active' AND monitoring=1). Clearing only status left the row
+// `paused, monitoring=1`, which a later ungated resume could flip straight back to monitored.
 huntRoutes.post('/hunts/:id/pause', (c) => {
   const id = parseInt(c.req.param('id'));
   const db = getDealDb();
 
   const result = db
     .prepare(
-      "UPDATE hunts SET status = 'paused' WHERE id = ? AND status = 'active'",
+      "UPDATE hunts SET status = 'paused', monitoring = 0 WHERE id = ? AND status = 'active'",
     )
     .run(id);
 
@@ -261,21 +303,36 @@ huntRoutes.post('/hunts/:id/pause', (c) => {
   return c.json({ success: true });
 });
 
-// Resume hunt
+// Resume hunt — mirrors the MCP `resume`: re-run the activation gate (valid criteria for the
+// vertical AND >=1 market segment) and only then set status='active', monitoring=1. The dashboard
+// is a second writer to the same DB, so without this it could re-activate a malformed/unbaselined
+// hunt that the watcher would then poll (throwing, auto-pausing the source). On gate failure the
+// hunt stays paused and we return 400 with the missing items.
 huntRoutes.post('/hunts/:id/resume', (c) => {
   const id = parseInt(c.req.param('id'));
   const db = getDealDb();
 
-  const result = db
-    .prepare(
-      "UPDATE hunts SET status = 'active' WHERE id = ? AND status = 'paused'",
-    )
-    .run(id);
+  const hunt = db
+    .prepare('SELECT id, criteria, vertical, status, search_terms FROM hunts WHERE id = ?')
+    .get(id) as HuntRow | undefined;
 
-  if (result.changes === 0) {
-    return c.json({ error: 'Hunt not found or not paused' }, 400);
+  if (!hunt) return c.json({ error: 'Hunt not found' }, 404);
+  if (hunt.status !== 'paused') {
+    return c.json({ error: 'Hunt is not paused' }, 400);
   }
 
+  const gate = evaluateActivationGate(db, hunt);
+  if (!gate.ok) {
+    return c.json(
+      {
+        error: 'Cannot resume — activation gate not satisfied. Fix criteria and/or run /price-baselining.',
+        missing: gate.errors,
+      },
+      400,
+    );
+  }
+
+  db.prepare("UPDATE hunts SET status = 'active', monitoring = 1 WHERE id = ?").run(id);
   return c.json({ success: true });
 });
 

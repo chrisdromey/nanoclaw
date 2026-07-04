@@ -13,6 +13,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import Database from 'better-sqlite3';
+import { evaluateActivationGate, validateCriteriaForVertical, type HuntRow } from './deal-hunter-gate.js';
 
 // --- DB Initialization ---
 // Schema is owned by the watcher service. This MCP server only reads/writes.
@@ -43,6 +44,35 @@ function jsonResult(data: unknown) {
 
 function errorResult(message: string) {
   return { content: [{ type: 'text' as const, text: JSON.stringify({ error: message }) }], isError: true };
+}
+
+// Resolve a hunt's gate_version (provenance regime). NULL/absent/legacy → 1; v2+ hunts must have
+// their segment prices DERIVED from recorded comps rather than typed by the agent.
+function huntGateVersion(huntId: number): number {
+  try {
+    const row = db.prepare('SELECT gate_version FROM hunts WHERE id = ?').get(huntId) as
+      | { gate_version: number | null }
+      | undefined;
+    return row && typeof row.gate_version === 'number' ? row.gate_version : 1;
+  } catch {
+    return 1;
+  }
+}
+
+// p25 / median / p75 of a numeric sample (linear interpolation), or null for an empty sample.
+// Used to DERIVE a segment's price band from its sourced comps so the band can't be hallucinated.
+function percentiles(values: number[]): { low: number; mid: number; high: number } | null {
+  const xs = values.filter((v) => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
+  if (xs.length === 0) return null;
+  const at = (p: number): number => {
+    if (xs.length === 1) return xs[0];
+    const idx = p * (xs.length - 1);
+    const lo = Math.floor(idx);
+    const hi = Math.ceil(idx);
+    if (lo === hi) return xs[lo];
+    return xs[lo] + (xs[hi] - xs[lo]) * (idx - lo);
+  };
+  return { low: at(0.25), mid: at(0.5), high: at(0.75) };
 }
 
 // Vertical capabilities are mirrored from config/verticals.yml into the `verticals` table
@@ -156,15 +186,19 @@ server.tool(
 // ============================================================
 server.tool(
   'manage_hunt',
-  'Create, update, pause, resume, or close a hunt. Close cascades: dismisses hunt_offers and clears watches on associated offers.',
+  "Manage a hunt's lifecycle. Lifecycle: create → (baseline) → activate → pause/resume → close. " +
+    "`create` always makes a DRAFT hunt that is NOT monitored — record market segments via /price-baselining, then call `activate`. " +
+    '`activate` is the gate: it refuses unless the criteria are valid for the vertical AND at least one market segment exists, then enables monitoring. ' +
+    '`update` edits a hunt but cannot turn monitoring on (use `activate`). `resume` re-runs the gate. ' +
+    '`close` cascades: dismisses hunt_offers and clears watches on associated offers.',
   {
-    action: z.enum(['create', 'update', 'pause', 'resume', 'close']),
+    action: z.enum(['create', 'update', 'pause', 'resume', 'close', 'activate']),
     hunt_id: z.number().optional().describe('Required for update/pause/resume/close'),
     name: z.string().optional().describe('Hunt name (required for create)'),
     criteria: z.string().optional().describe('JSON string of criteria object'),
     search_terms: z.string().optional().describe('JSON string of search terms. Simple format: ["term1", "term2"]. Per-term categories: [{"terms": "term1", "category_ids": "1244"}, {"terms": "term2"}]. Per-term category_ids override hunt-level category_ids.'),
     cadence_minutes: z.number().optional(),
-    monitoring: z.boolean().optional().describe('Enable/disable watcher monitoring for this hunt (default true). Set false during research/baselining.'),
+    monitoring: z.boolean().optional().describe('Only `false` is honoured here, to stop monitoring an active hunt via update. To START monitoring, use action:activate (it checks criteria + segments). Ignored on create — new hunts are always draft (unmonitored).'),
     category_ids: z.string().optional().describe('Comma-separated eBay category IDs to filter watcher searches (e.g. "179" for PC Desktops). Acts as the default for all search terms. Individual terms can override via per-term category_ids in search_terms. eBay-only.'),
     vertical: z.string().optional().describe("Vertical for this hunt, e.g. 'computers' (eBay) or 'cars' (AutoTrader). Defaults to 'computers' on create. Determines which evaluator/source the watcher uses."),
     sources: z.array(z.string()).optional().describe("Source adapters to poll, e.g. ['ebay'] or ['autotrader']. Defaults from the vertical when omitted on create."),
@@ -178,36 +212,68 @@ server.tool(
       const huntSources = sources && sources.length > 0
         ? sources
         : defaultSourcesForVertical(huntVertical);
+      // New hunts are always created as a DRAFT and never monitored. Monitoring is only enabled
+      // by action:activate, which gates on valid criteria + at least one market segment.
+      // gate_version 2 = the strict provenance regime (B/C/D). Every newly-created hunt is stamped
+      // v2; pre-existing hunts keep gate_version NULL and are grandfathered by the activation gate.
       const result = db.prepare(`
-        INSERT INTO hunts (name, criteria, search_terms, cadence_minutes, monitoring, category_ids, vertical, sources, poll_interval_minutes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO hunts (name, status, criteria, search_terms, cadence_minutes, monitoring, category_ids, vertical, sources, poll_interval_minutes, gate_version)
+        VALUES (?, 'draft', ?, ?, ?, 0, ?, ?, ?, ?, 2)
       `).run(
         name,
         criteria || '{}',
         search_terms || '[]',
         cadence_minutes || 60,
-        monitoring === false ? 0 : 1,
         category_ids || null,
         huntVertical,
         JSON.stringify(huntSources),
         poll_interval_minutes ?? null,
       );
       const hunt = db.prepare('SELECT * FROM hunts WHERE id = ?').get(result.lastInsertRowid);
-      return jsonResult({ action: 'created', hunt });
+      // Surface criteria problems now (non-blocking — criteria can be refined before activation).
+      let criteria_warnings: string[] = [];
+      try {
+        criteria_warnings = validateCriteriaForVertical(db, huntVertical, JSON.parse(criteria || '{}'));
+      } catch {
+        criteria_warnings = ['criteria is not valid JSON'];
+      }
+      return jsonResult({
+        action: 'created',
+        hunt,
+        criteria_warnings,
+        next_step:
+          'Hunt created as DRAFT (not monitored). Record market segments via /price-baselining, ' +
+          'then call manage_hunt action:activate to start monitoring.',
+      });
     }
 
     if (!hunt_id) return errorResult('hunt_id is required for ' + action);
-    const existing = db.prepare('SELECT * FROM hunts WHERE id = ?').get(hunt_id);
+    const existing = db.prepare('SELECT * FROM hunts WHERE id = ?').get(hunt_id) as HuntRow | undefined;
     if (!existing) return errorResult('Hunt not found: ' + hunt_id);
 
-    if (action === 'update') {
+    if (action === 'activate' || action === 'resume') {
+      const gate = evaluateActivationGate(db, existing);
+      if (!gate.ok) {
+        return errorResult(
+          `Cannot ${action} hunt ${hunt_id} — activation gate not satisfied:\n- ${gate.errors.join('\n- ')}\n\n` +
+            'Fix the criteria (manage_hunt action:update) and/or record market segments (/price-baselining), then try again.',
+        );
+      }
+      db.prepare("UPDATE hunts SET status = 'active', monitoring = 1 WHERE id = ?").run(hunt_id);
+    } else if (action === 'update') {
+      if (monitoring === true) {
+        return errorResult(
+          'Cannot enable monitoring via update — use action:activate, which verifies the hunt has ' +
+            'valid criteria and at least one market segment.',
+        );
+      }
       const sets: string[] = [];
       const params: unknown[] = [];
       if (name !== undefined) { sets.push('name = ?'); params.push(name); }
       if (criteria !== undefined) { sets.push('criteria = ?'); params.push(criteria); }
       if (search_terms !== undefined) { sets.push('search_terms = ?'); params.push(search_terms); }
       if (cadence_minutes !== undefined) { sets.push('cadence_minutes = ?'); params.push(cadence_minutes); }
-      if (monitoring !== undefined) { sets.push('monitoring = ?'); params.push(monitoring ? 1 : 0); }
+      if (monitoring === false) { sets.push('monitoring = ?'); params.push(0); }
       if (category_ids !== undefined) { sets.push('category_ids = ?'); params.push(category_ids || null); }
       if (vertical !== undefined) { sets.push('vertical = ?'); params.push(vertical); }
       if (sources !== undefined) { sets.push('sources = ?'); params.push(JSON.stringify(sources)); }
@@ -216,9 +282,7 @@ server.tool(
       params.push(hunt_id);
       db.prepare(`UPDATE hunts SET ${sets.join(', ')} WHERE id = ?`).run(...params);
     } else if (action === 'pause') {
-      db.prepare("UPDATE hunts SET status = 'paused' WHERE id = ?").run(hunt_id);
-    } else if (action === 'resume') {
-      db.prepare("UPDATE hunts SET status = 'active' WHERE id = ?").run(hunt_id);
+      db.prepare("UPDATE hunts SET status = 'paused', monitoring = 0 WHERE id = ?").run(hunt_id);
     } else if (action === 'close') {
       const closeHunt = db.transaction(() => {
         db.prepare(
@@ -1135,16 +1199,24 @@ server.tool(
     description: z.string().optional().describe('What defines this segment'),
     tags: z.string().optional().describe('JSON array of tags used to match offers to this segment. Include the product model (e.g. "5650G") AND attribute tags (e.g. "ECC-confirmed", "ATX"). Reuse tags from existing segments for consistency — check all_hunt_segments in the response.'),
     filter_patterns: z.string().optional().describe('JSON object of title patterns, condition filters, price hints for future auto-classification'),
-    price_low: z.number().optional().describe('Good deal threshold — below this is cheap'),
-    price_mid: z.number().optional().describe('Typical/fair market price'),
-    price_high: z.number().optional().describe('Overpriced threshold — above this is too much'),
-    sample_size: z.number().optional().describe('How many data points informed these tiers'),
-    confidence: z.enum(['HIGH', 'MEDIUM', 'LOW']).optional().describe('HIGH: 20+ consistent points, MEDIUM: 10-20 or some variance, LOW: <10 or highly variable'),
+    price_low: z.number().optional().describe('DEPRECATED for v2 hunts — price bands are DERIVED from recorded comps. Record comps via record_baseline_price then call recompute_segment_prices. (Legacy v1 hunts: good-deal threshold.)'),
+    price_mid: z.number().optional().describe('DEPRECATED for v2 hunts (derived). Legacy v1: typical/fair market price.'),
+    price_high: z.number().optional().describe('DEPRECATED for v2 hunts (derived). Legacy v1: overpriced threshold.'),
+    sample_size: z.number().optional().describe('DEPRECATED for v2 hunts (derived from comp count). Legacy v1: data points informing the tiers.'),
+    confidence: z.enum(['HIGH', 'MEDIUM', 'LOW']).optional().describe('DEPRECATED for v2 hunts (derived). Legacy v1: HIGH 20+ consistent / MEDIUM 10-20 or some variance / LOW <10 or variable.'),
     notes: z.string().optional().describe('Market observations, gotchas, caveats'),
   },
   async (args) => {
     const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
     if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+
+    // v2 hunts: price bands + sample_size + confidence are DERIVED from sourced comps by
+    // recompute_segment_prices, so agent-supplied values for those are ignored here (the agent's job
+    // is the bucketing: name, tags, description). Legacy v1 hunts keep accepting them.
+    const v2 = huntGateVersion(args.hunt_id) >= 2;
+    const note = v2
+      ? 'v2 hunt: price_low/mid/high, sample_size and confidence are DERIVED — record comps via record_baseline_price then call recompute_segment_prices. Any price values passed here were ignored.'
+      : undefined;
 
     const existing = db.prepare(
       'SELECT * FROM market_segments WHERE hunt_id = ? AND name = ?',
@@ -1156,17 +1228,17 @@ server.tool(
       if (args.description !== undefined) { sets.push('description = ?'); params.push(args.description); }
       if (args.tags !== undefined) { sets.push('tags = ?'); params.push(args.tags); }
       if (args.filter_patterns !== undefined) { sets.push('filter_patterns = ?'); params.push(args.filter_patterns); }
-      if (args.price_low !== undefined) { sets.push('price_low = ?'); params.push(args.price_low); }
-      if (args.price_mid !== undefined) { sets.push('price_mid = ?'); params.push(args.price_mid); }
-      if (args.price_high !== undefined) { sets.push('price_high = ?'); params.push(args.price_high); }
-      if (args.sample_size !== undefined) { sets.push('sample_size = ?'); params.push(args.sample_size); }
-      if (args.confidence !== undefined) { sets.push('confidence = ?'); params.push(args.confidence); }
+      if (!v2 && args.price_low !== undefined) { sets.push('price_low = ?'); params.push(args.price_low); }
+      if (!v2 && args.price_mid !== undefined) { sets.push('price_mid = ?'); params.push(args.price_mid); }
+      if (!v2 && args.price_high !== undefined) { sets.push('price_high = ?'); params.push(args.price_high); }
+      if (!v2 && args.sample_size !== undefined) { sets.push('sample_size = ?'); params.push(args.sample_size); }
+      if (!v2 && args.confidence !== undefined) { sets.push('confidence = ?'); params.push(args.confidence); }
       if (args.notes !== undefined) { sets.push('notes = ?'); params.push(args.notes); }
       params.push(existing.id);
       db.prepare(`UPDATE market_segments SET ${sets.join(', ')} WHERE id = ?`).run(...params);
       const updated = db.prepare('SELECT * FROM market_segments WHERE id = ?').get(existing.id);
       const allSegments = db.prepare('SELECT id, name, tags FROM market_segments WHERE hunt_id = ?').all(args.hunt_id);
-      return jsonResult({ action: 'updated', segment: updated, all_hunt_segments: allSegments });
+      return jsonResult({ action: 'updated', segment: updated, all_hunt_segments: allSegments, note });
     } else {
       const result = db.prepare(`
         INSERT INTO market_segments (hunt_id, name, description, tags, filter_patterns, price_low, price_mid, price_high, sample_size, confidence, notes)
@@ -1174,12 +1246,12 @@ server.tool(
       `).run(
         args.hunt_id, args.name, args.description || null,
         args.tags || '[]', args.filter_patterns || '{}',
-        args.price_low ?? null, args.price_mid ?? null, args.price_high ?? null,
-        args.sample_size ?? 0, args.confidence || 'LOW', args.notes || null,
+        v2 ? null : (args.price_low ?? null), v2 ? null : (args.price_mid ?? null), v2 ? null : (args.price_high ?? null),
+        v2 ? 0 : (args.sample_size ?? 0), v2 ? 'LOW' : (args.confidence || 'LOW'), args.notes || null,
       );
       const segment = db.prepare('SELECT * FROM market_segments WHERE id = ?').get(result.lastInsertRowid);
       const allSegments = db.prepare('SELECT id, name, tags FROM market_segments WHERE hunt_id = ?').all(args.hunt_id);
-      return jsonResult({ action: 'created', segment, all_hunt_segments: allSegments });
+      return jsonResult({ action: 'created', segment, all_hunt_segments: allSegments, note });
     }
   },
 );
@@ -1395,6 +1467,169 @@ server.tool(
       alerts,
       status_changes: statusChanges,
     });
+  },
+);
+
+// ============================================================
+// Tool 20: recompute_segment_prices  (provenance gating — B)
+// ============================================================
+server.tool(
+  'recompute_segment_prices',
+  "Derive a segment's price band (low/mid/high) from its recorded baseline_prices comps — the ONLY way v2 hunts get prices (they are never typed). Computes p25/median/p75 of each comp's landed price (total_landed_gbp, else price), counts only comps with a source_url AND source_item_id (sourced) AND non-empty tags (bucketed), updates sample_size, and derives confidence from comp count + spread. Returns the band, sample size and the within-segment spread so a too-wide bucket (mixed trims/packs) is obvious. Run after record_baseline_price. Omit segment_id to recompute every segment of the hunt.",
+  {
+    hunt_id: z.number(),
+    segment_id: z.number().optional().describe('Recompute one segment; omit to recompute all segments of the hunt'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+
+    const segments = (args.segment_id
+      ? db.prepare('SELECT id, name FROM market_segments WHERE hunt_id = ? AND id = ?').all(args.hunt_id, args.segment_id)
+      : db.prepare('SELECT id, name FROM market_segments WHERE hunt_id = ?').all(args.hunt_id)
+    ) as Array<{ id: number; name: string }>;
+    if (segments.length === 0) return errorResult('No matching segments to recompute');
+
+    const compStmt = db.prepare(
+      `SELECT total_landed_gbp, price, tags FROM baseline_prices
+       WHERE segment_id = ?
+         AND source_url IS NOT NULL AND trim(source_url) != ''
+         AND source_item_id IS NOT NULL AND trim(source_item_id) != ''`,
+    );
+    const hasTags = (raw: string | null): boolean => {
+      if (!raw || raw.trim() === '' || raw.trim() === '[]') return false;
+      try {
+        const a = JSON.parse(raw);
+        return Array.isArray(a) && a.some((t) => typeof t === 'string' && t.trim() !== '');
+      } catch {
+        return raw.trim() !== '';
+      }
+    };
+
+    const results = [];
+    for (const seg of segments) {
+      const comps = compStmt.all(seg.id) as Array<{ total_landed_gbp: number | null; price: number | null; tags: string | null }>;
+      const prices = comps
+        .filter((c) => hasTags(c.tags))
+        .map((c) => (typeof c.total_landed_gbp === 'number' ? c.total_landed_gbp : c.price))
+        .filter((p): p is number => typeof p === 'number' && p > 0);
+      const band = percentiles(prices);
+      const n = prices.length;
+      const spread = n >= 2 ? Math.max(...prices) / Math.min(...prices) : 1;
+      // Confidence from sample size AND tightness: a wide spread can't be HIGH even with many comps.
+      let confidence: 'HIGH' | 'MEDIUM' | 'LOW' = 'LOW';
+      if (n >= 8 && spread <= 1.6) confidence = 'HIGH';
+      else if (n >= 4 && spread <= 2.2) confidence = 'MEDIUM';
+      if (band) {
+        db.prepare(
+          "UPDATE market_segments SET price_low = ?, price_mid = ?, price_high = ?, sample_size = ?, confidence = ?, updated_at = datetime('now') WHERE id = ?",
+        ).run(Math.round(band.low), Math.round(band.mid), Math.round(band.high), n, confidence, seg.id);
+      } else {
+        db.prepare(
+          "UPDATE market_segments SET sample_size = 0, confidence = 'LOW', updated_at = datetime('now') WHERE id = ?",
+        ).run(seg.id);
+      }
+      results.push({
+        segment_id: seg.id,
+        name: seg.name,
+        sourced_comps: n,
+        price_low: band ? Math.round(band.low) : null,
+        price_mid: band ? Math.round(band.mid) : null,
+        price_high: band ? Math.round(band.high) : null,
+        spread_ratio: n >= 2 ? Number(spread.toFixed(2)) : null,
+        confidence,
+        warning:
+          n === 0
+            ? 'No sourced+tagged comps — record real comps with source_url, source_item_id and trim tags.'
+            : spread > 2.5
+              ? 'Spread > 2.5× — this bucket likely mixes trims/packs. Split it into tighter segments.'
+              : undefined,
+      });
+    }
+    return jsonResult({ hunt_id: args.hunt_id, recomputed: results.length, segments: results });
+  },
+);
+
+// ============================================================
+// Tool 21: record_kb_coverage  (provenance gating — C)
+// ============================================================
+server.tool(
+  'record_kb_coverage',
+  "Register that a per-target spec knowledge base has been built and cited, so a feature-led hunt can pass the activation gate's KB check (C). Call once per criteria.targets key after /car-spec-research writes the KB file. must_have_citations maps each of the hunt's intent.must_have features to the count of distinct source URLs that substantiate it in the KB — every must-have needs ≥1 cited source or the gate blocks. Upserts by (hunt_id, target_key).",
+  {
+    hunt_id: z.number(),
+    target_key: z.string().describe('The criteria.targets key this KB covers, e.g. "Polestar 2" (must match exactly)'),
+    kb_path: z.string().describe('Path to the KB file, e.g. references/product-knowledge/cars/polestar-polestar-2.md'),
+    must_have_citations: z.record(z.string(), z.number()).describe('JSON object mapping each must-have feature → number of distinct cited source URLs in the KB, e.g. {"Adaptive cruise control (ACC)": 2}'),
+    citation_count: z.number().optional().describe('Total distinct source URLs in the KB (optional, for reporting)'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id, vertical FROM hunts WHERE id = ?').get(args.hunt_id) as { id: number; vertical: string } | undefined;
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+    const totalCitations =
+      args.citation_count ?? Object.values(args.must_have_citations).reduce((a, b) => a + (b || 0), 0);
+    db.prepare(
+      `INSERT INTO knowledge_base (hunt_id, vertical, target_key, kb_path, citation_count, must_have_citations, built_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(hunt_id, target_key) DO UPDATE SET
+         vertical = excluded.vertical, kb_path = excluded.kb_path,
+         citation_count = excluded.citation_count, must_have_citations = excluded.must_have_citations,
+         built_at = excluded.built_at`,
+    ).run(args.hunt_id, hunt.vertical, args.target_key, args.kb_path, totalCitations, JSON.stringify(args.must_have_citations));
+    return jsonResult({ action: 'recorded', hunt_id: args.hunt_id, target_key: args.target_key, kb_path: args.kb_path, citation_count: totalCitations });
+  },
+);
+
+// ============================================================
+// Tool 22: record_claim_verification  (provenance gating — D)
+// ============================================================
+server.tool(
+  'record_claim_verification',
+  "Record the adversarial verdict for one (target, must-have feature) pair, from independently re-fetched sources — the activation gate (D) blocks until every must-have for every target is 'verified'. Use 'contradicted' when a source shows the feature is NOT standard/available as claimed (e.g. it's an optional pack), with the evidence URL. Upserts by (hunt_id, target_key, feature). This is the check that catches a hallucinated spec before a hunt goes live.",
+  {
+    hunt_id: z.number(),
+    target_key: z.string().describe('The criteria.targets key, e.g. "Polestar 2"'),
+    feature: z.string().describe('The exact intent.must_have string being verified'),
+    verdict: z.enum(['verified', 'unverified', 'contradicted']).describe("'verified': a source confirms it; 'contradicted': a source refutes it (e.g. optional-only); 'unverified': could not confirm either way"),
+    evidence_url: z.string().optional().describe('URL of the source consulted (required in practice for verified/contradicted)'),
+    notes: z.string().optional().describe('What the source said; any caveats'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+    db.prepare(
+      `INSERT INTO claim_verifications (hunt_id, target_key, feature, verdict, evidence_url, notes, checked_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(hunt_id, target_key, feature) DO UPDATE SET
+         verdict = excluded.verdict, evidence_url = excluded.evidence_url,
+         notes = excluded.notes, checked_at = excluded.checked_at`,
+    ).run(args.hunt_id, args.target_key, args.feature, args.verdict, args.evidence_url || null, args.notes || null);
+    return jsonResult({ action: 'recorded', hunt_id: args.hunt_id, target_key: args.target_key, feature: args.feature, verdict: args.verdict });
+  },
+);
+
+// ============================================================
+// Tool 23: waive_must_have  (provenance gating — D escape hatch)
+// ============================================================
+server.tool(
+  'waive_must_have',
+  "Waive the verification requirement for one (target, must-have) pair when it genuinely can't be confirmed online — records a 'verified' verdict tagged as user-waived (auditable, distinct from a real verification). Use ONLY on explicit user instruction. Lets the activation gate (D) pass for that pair.",
+  {
+    hunt_id: z.number(),
+    target_key: z.string(),
+    feature: z.string().describe('The exact intent.must_have string to waive'),
+    reason: z.string().describe('Why it is being waived (recorded for audit)'),
+  },
+  async (args) => {
+    const hunt = db.prepare('SELECT id FROM hunts WHERE id = ?').get(args.hunt_id);
+    if (!hunt) return errorResult(`Hunt ${args.hunt_id} not found`);
+    db.prepare(
+      `INSERT INTO claim_verifications (hunt_id, target_key, feature, verdict, evidence_url, notes, checked_at)
+       VALUES (?, ?, ?, 'verified', NULL, ?, datetime('now'))
+       ON CONFLICT(hunt_id, target_key, feature) DO UPDATE SET
+         verdict = 'verified', evidence_url = NULL, notes = excluded.notes, checked_at = excluded.checked_at`,
+    ).run(args.hunt_id, args.target_key, args.feature, `USER-WAIVED: ${args.reason}`);
+    return jsonResult({ action: 'waived', hunt_id: args.hunt_id, target_key: args.target_key, feature: args.feature });
   },
 );
 

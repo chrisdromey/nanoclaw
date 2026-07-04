@@ -19,6 +19,7 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { buildEvaluatorAgents } from './vertical-agents.js';
+import { createManageHuntGateHook, createDraftGuardStopHook } from './deal-hunter-hooks.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -456,6 +457,9 @@ If something fails, say so — don't retry silently. Say what went wrong and wha
     prompt: stream,
     options: {
       cwd: '/workspace/group',
+      // Orchestrator runs on sonnet: it routes/dispatches and handles interactive chat, while the
+      // judgment-heavy work is delegated to sub-agents (also sonnet). Opus isn't needed for routing.
+      model: 'sonnet',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -551,6 +555,8 @@ Key rules:
 - Return a concise summary (under 500 words) of your research findings
 - Include: search terms used, segments identified, price ranges found, and any market observations
 - Record all structured data (market segments, baseline prices) to the database before returning
+- For a feature-led hunt, bucketing comes BEFORE pricing: read/build the per-model knowledge base first, then define segments from its trim ladder, record sourced comps (with source_url, source_item_id and trim tags) into each, and call recompute_segment_prices to DERIVE the band — never type prices. After writing each KB file, call record_kb_coverage so the activation gate can see it.
+- Do NOT activate a feature-led hunt yourself before its must-have features have been independently verified — that is the musthave-verifier's job (the gate will block otherwise)
 - Write prose findings to the hunt file (and knowledge-base files) as the skills instruct`,
           tools: [
             'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
@@ -573,6 +579,31 @@ Key rules:
             ...(process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET ? ['ebay-api'] : []),
           ],
         },
+        'musthave-verifier': {
+          description: "Adversarially verifies a feature-led hunt's must-have features for each target model BEFORE activation, from independently re-fetched primary sources (not the hunt's own knowledge base). Delegate when a feature-led hunt is ready to activate, or to re-check a contradicted/unverified must-have. Records a verdict per (target, must-have) so the activation gate can pass.",
+          prompt: `You are an adversarial spec verifier. Your job is to CONFIRM OR REFUTE, from primary sources, that each must-have feature is actually available on each target model in the hunt — catching hallucinated or over-stated spec claims before a hunt goes live.
+
+Process:
+1. Read the hunt with get_hunt: take criteria.intent.must_have (the features) and criteria.targets (the models, keyed by search term).
+2. For every (target, must-have) pair, independently WebSearch/WebFetch authoritative UK sources (Parkers, manufacturer brochures, What Car?, owner forums). Do NOT trust the hunt's knowledge-base file as ground truth — re-derive it; the whole point is an independent check.
+3. Be sceptical and contradiction-seeking. A feature being *standard on all trims* is a stronger claim than *available as an option*. If it's only an optional pack (e.g. Pilot Assist on the Polestar 2 Pilot Pack), the claim "standard" is CONTRADICTED.
+4. Record each verdict with record_claim_verification (verified / unverified / contradicted) plus the evidence_url and a short note of what the source said.
+
+Key rules:
+- Do NOT message the user directly — you have no access to the nanoclaw MCP
+- Verify every (target × must-have) pair — partial coverage leaves the gate blocked
+- Prefer 'unverified' over a guess when sources are silent or conflicting; never invent a verdict
+- Return a concise summary (under 500 words): per target, which must-haves verified / unverified / contradicted, with the key evidence`,
+          tools: [
+            'Bash', 'Read', 'Glob', 'Grep',
+            'WebSearch', 'WebFetch',
+            'TodoWrite',
+            'mcp__deal-hunter-db__*',
+          ],
+          model: 'sonnet',
+          skills: ['musthave-verification'],
+          mcpServers: ['deal-hunter-db'],
+        },
         'generic-deal-evaluator': {
           description: 'Default deal evaluator for verticals without a bespoke skill. Use as fallback for T1 verticals (cookers, AC units, generic categories) where no vertical-specific evaluator exists.',
           prompt: `You are a general-purpose deal evaluation specialist. Follow the generic-deal-evaluator skill instructions precisely.
@@ -589,7 +620,10 @@ Key rules:
             'mcp__deal-hunter-db__*',
             'mcp__sold-data__*',
           ],
-          model: 'sonnet',
+          // Haiku: this evaluator is threshold-based (offer price vs sold-comp baseline /
+          // price tier → ALERT/WATCH/SKIP) and serves low-value T1/T2 verticals. The nuanced
+          // intent-triage work lives in the bespoke evaluators, which stay on sonnet.
+          model: 'haiku',
           skills: ['generic-deal-evaluator'],
           mcpServers: [
             'deal-hunter-db',
@@ -599,6 +633,10 @@ Key rules:
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+        // Deal Hunter activation gate (behavioural): deny premature activate/resume early, and
+        // block finishing a session that left a freshly-created hunt as an un-baselined draft.
+        PreToolUse: [{ matcher: 'mcp__deal-hunter-db__manage_hunt', hooks: [createManageHuntGateHook()] }],
+        Stop: [{ hooks: [createDraftGuardStopHook()] }],
       },
     }
   })) {

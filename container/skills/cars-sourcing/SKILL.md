@@ -25,12 +25,32 @@ you know which trims matter to the brief; if a candidate model has none, build i
 - `mcp__autotrader-search__autotrader_search` — comparable listings for a make/model with
   the hunt's year/mileage/price/fuel/transmission and postcode. Listing titles and subtitles
   carry the derivative (trim) string, so you can group results by trim.
+  - **Model names are exact AutoTrader enum strings, not the obvious name.** Most makes use the
+    short name (`A4`, `3 Series`, `Focus`), but some are make-prefixed — e.g. Polestar's model
+    is `Polestar 2` (and `Polestar 3`), **not** `2`. A wrong model string returns **zero** results
+    silently (it looks identical to "none in budget"), so don't conclude a car is unavailable from
+    an empty model search. If a make+model search returns 0, re-run it **make-only** and read the
+    exact model string off the returned listings, then retry with that value. The tool also flags
+    this for you: an empty model search that has make-only listings comes back with a
+    `model_mismatch_warning`. Use the confirmed exact string when you set `criteria.targets.*.model`.
 - `mcp__autotrader-search__autotrader_detail` — full spec/feature detail for one listing. Use
   it on a few representatives when you need spec context to explain price differences between
   trims.
 
 There is no sold data for used cars on AutoTrader. Do not use the eBay tools (`sold-data`,
 `ebay-search`, `ebay-api`) for cars.
+
+## What the search can filter vs what the evaluator judges
+
+AutoTrader (and therefore the hunt's monitoring search) can only filter on **make, model, year,
+price, mileage, fuel, transmission, postcode**. It **cannot** filter on features, trims, packs,
+or "must not be X" rules — those are read off each returned listing by the evaluator. So the
+monitoring search is a **wide net**: it pulls every car of the right make/model/budget and the
+evaluator triages spec afterward. When you shape a hunt, this is the split to respect — the
+searchable constraints go in `criteria.shared`/`criteria.targets`; feature/trim/reject intent
+goes in `criteria.intent` for the evaluator. Don't try to narrow the net with things the search
+can't express (e.g. "must have adaptive cruise"); that belongs in `intent`, and over-narrowing
+the search just hides good cars whose listings are vaguely worded.
 
 ## Segmenting by model + trim
 

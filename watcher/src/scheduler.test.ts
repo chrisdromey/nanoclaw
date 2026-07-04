@@ -163,6 +163,7 @@ function makeState(): SchedulerState {
     dailyApiCalls: new Map(),
     dailyApiCallsResetAt: Date.now() + 86_400_000,
     consecutiveFailures: new Map(),
+    sourcePausedAt: new Map(),
   };
 }
 
@@ -301,15 +302,132 @@ describe('Scheduler dispatch', () => {
       minIntervalMs: 0,
     });
 
-    // Pre-seed the in-memory failure counter to threshold
+    // Pre-seed the in-memory failure counter to threshold, freshly paused (as
+    // recordSourceFailure would: cool-down clock starts now, so no probe yet).
     const state = makeState();
     state.consecutiveFailures.set(`${huntId}:ebay:bomb`, 10);
+    state.sourcePausedAt.set(`${huntId}:ebay:bomb`, Date.now());
 
     const { tick } = await import('./scheduler.js');
     await tick(state, db);
 
     // Adapter should NOT have been called (source is paused in state)
     expect(searchMock).not.toHaveBeenCalled();
+  });
+
+  it('arms sourcePausedAt once a real failing adapter crosses the failure threshold', async () => {
+    // Unlike the pre-seeded auto-pause test above, this drives a genuinely-throwing
+    // adapter through tick() until it crosses CONSECUTIVE_FAILURE_PAUSE_THRESHOLD (10)
+    // and asserts the cool-down clock was actually armed by recordSourceFailure.
+    // It must fail if `state.sourcePausedAt.set(key, Date.now())` (~scheduler.ts:179) is removed.
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
+      VALUES ('Arm Hunt', '["kaboom"]', 0, '["ebay"]', 'computers')
+    `).run();
+    const huntId = (db.prepare('SELECT id FROM hunts').get() as { id: number }).id;
+
+    const failingSearch = vi.fn().mockRejectedValue(new Error('persistent network error'));
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'ebay',
+      search: failingSearch,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: true, richSearch: true, needsDetailFetch: false },
+      minIntervalMs: 0,
+    });
+
+    const state = makeState();
+    const key = `${huntId}:ebay:kaboom`;
+    const { tick } = await import('./scheduler.js');
+
+    // Run 10 ticks. cadence_minutes=0 means cadence never gates; but Bug 1's fix now
+    // advances lastSearchTime on a throw, so clear it between ticks to re-run the search.
+    // Cool-down hasn't elapsed between ticks, so once armed the source is skipped — run
+    // exactly enough ticks to reach the threshold (10 actual searches → 10 failures).
+    for (let i = 0; i < 10; i++) {
+      state.lastSearchTime.clear();
+      await tick(state, db);
+    }
+
+    // Threshold reached → the cool-down clock must have been armed (NOT pre-seeded).
+    expect(failingSearch).toHaveBeenCalledTimes(10);
+    expect(state.consecutiveFailures.get(key)).toBe(10);
+    expect(state.sourcePausedAt.get(key)).toBeGreaterThan(0);
+  });
+
+  it('does NOT count a translator/config error toward the auto-pause budget', async () => {
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
+      VALUES ('Config Error Hunt', '["broken"]', 0, '["ebay"]', 'computers')
+    `).run();
+    const huntId = (db.prepare('SELECT id FROM hunts').get() as { id: number }).id;
+
+    // Translator throws deterministically (e.g. missing required criteria field).
+    mockGetTranslator.mockReturnValue(() => {
+      throw new Error('translateCarsCriteriaToAutotrader: criteria.make is required');
+    });
+
+    const searchMock = vi.fn().mockResolvedValue({ listings: [], apiCalls: 0, errors: [] });
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'ebay',
+      search: searchMock,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: true, richSearch: true, needsDetailFetch: false },
+      minIntervalMs: 0,
+    });
+
+    const state = makeState();
+    const { tick } = await import('./scheduler.js');
+    // Run several ticks; a config error must never accrue consecutive_failures.
+    await tick(state, db);
+    state.lastSearchTime.clear();
+    await tick(state, db);
+    state.lastSearchTime.clear();
+    await tick(state, db);
+
+    // The network adapter is never reached, and no failure budget is burned.
+    expect(searchMock).not.toHaveBeenCalled();
+    expect(state.consecutiveFailures.get(`${huntId}:ebay:broken`) ?? 0).toBe(0);
+    // It backs off to cadence (lastSearchTime set) instead of spamming every tick.
+    expect(state.lastSearchTime.has(`${huntId}:ebay:broken`)).toBe(true);
+  });
+
+  it('auto-pause is recoverable: probes again after the cool-down without a restart', async () => {
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
+      VALUES ('Recover Hunt', '["flaky"]', 0, '["ebay"]', 'computers')
+    `).run();
+    const huntId = (db.prepare('SELECT id FROM hunts').get() as { id: number }).id;
+
+    // Adapter now succeeds — simulating the transient outage having cleared.
+    const searchMock = vi.fn().mockResolvedValue({ listings: [], apiCalls: 0, errors: [] });
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'ebay',
+      search: searchMock,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: true, richSearch: true, needsDetailFetch: false },
+      minIntervalMs: 0,
+    });
+
+    const state = makeState();
+    const { tick } = await import('./scheduler.js');
+    const key = `${huntId}:ebay:flaky`;
+
+    // Paused, but cool-down has NOT elapsed → still skipped.
+    state.consecutiveFailures.set(key, 10);
+    state.sourcePausedAt.set(key, Date.now());
+    await tick(state, db);
+    expect(searchMock).not.toHaveBeenCalled();
+
+    // Cool-down elapsed → one probe is allowed; success clears the pause.
+    state.sourcePausedAt.set(key, Date.now() - 61 * 60_000); // > default 60-min cool-down
+    state.lastSearchTime.clear();
+    await tick(state, db);
+    expect(searchMock).toHaveBeenCalledTimes(1);
+    expect(state.consecutiveFailures.get(key)).toBe(0);
+    expect(state.sourcePausedAt.has(key)).toBe(false);
   });
 
   it('enforces per-source budget', async () => {

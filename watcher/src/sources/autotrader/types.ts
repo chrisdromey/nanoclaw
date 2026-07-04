@@ -11,7 +11,7 @@ export interface AutotraderSearchParams {
   /** Raw AT filter array — build via translateCarsCriteriaToAutotrader() */
   filters: AutotraderFilterInput[];
   page?: number;
-  sortBy?: 'relevance' | 'price-asc' | 'distance';
+  sortBy?: 'relevance' | 'price_asc' | 'price_desc' | 'distance';
 }
 
 /** Shape of one SearchListing from the GraphQL response */

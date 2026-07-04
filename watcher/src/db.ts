@@ -22,6 +22,7 @@ export interface Hunt {
   vertical: string;
   sources: string[];
   poll_interval_minutes: number | null;
+  gate_version?: number | null;
 }
 
 /** Parse hunt sources from a raw DB row (sources stored as JSON string). */
@@ -98,7 +99,7 @@ function ensureSchema(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS hunts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'closed')),
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('draft', 'active', 'paused', 'closed')),
       criteria TEXT NOT NULL DEFAULT '{}',
       search_terms TEXT NOT NULL DEFAULT '[]',
       cadence_minutes INTEGER NOT NULL DEFAULT 60,
@@ -238,6 +239,37 @@ function ensureSchema(db: Database.Database): void {
       synced_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Provenance gating (gate_version >= 2). Per-target spec knowledge-base coverage, recorded by
+    -- the car-spec-research skill so the DB-only activation gate can verify a cited KB exists for a
+    -- feature-led hunt before it activates. must_have_citations is a JSON map { feature: count }.
+    CREATE TABLE IF NOT EXISTS knowledge_base (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hunt_id INTEGER NOT NULL REFERENCES hunts(id),
+      vertical TEXT NOT NULL,
+      target_key TEXT NOT NULL,
+      kb_path TEXT NOT NULL,
+      citation_count INTEGER NOT NULL DEFAULT 0,
+      must_have_citations TEXT NOT NULL DEFAULT '{}',
+      built_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(hunt_id, target_key)
+    );
+
+    -- Provenance gating (gate_version >= 2). Adversarial verification of each must-have feature per
+    -- target, recorded by the musthave-verification sub-agent. A 'verified' verdict (including
+    -- user-waived ones, tagged in notes) satisfies the D gate check; missing/unverified/contradicted
+    -- blocks activation.
+    CREATE TABLE IF NOT EXISTS claim_verifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hunt_id INTEGER NOT NULL REFERENCES hunts(id),
+      target_key TEXT NOT NULL,
+      feature TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK(verdict IN ('verified', 'unverified', 'contradicted')),
+      evidence_url TEXT,
+      notes TEXT,
+      checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(hunt_id, target_key, feature)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_offers_source ON offers(source, source_id);
     CREATE INDEX IF NOT EXISTS idx_offers_watching ON offers(watching) WHERE watching = 1;
     CREATE INDEX IF NOT EXISTS idx_offers_status ON offers(status);
@@ -251,6 +283,8 @@ function ensureSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_baseline_prices_hunt ON baseline_prices(hunt_id);
     CREATE INDEX IF NOT EXISTS idx_baseline_prices_segment ON baseline_prices(segment_id);
     CREATE INDEX IF NOT EXISTS idx_hunt_log_hunt ON hunt_log(hunt_id, logged_at);
+    CREATE INDEX IF NOT EXISTS idx_knowledge_base_hunt ON knowledge_base(hunt_id);
+    CREATE INDEX IF NOT EXISTS idx_claim_verifications_hunt ON claim_verifications(hunt_id);
   `);
 
   // Migrations — add columns that were introduced after initial schema
@@ -263,6 +297,12 @@ function ensureSchema(db: Database.Database): void {
   }
   if (!huntCols.some((c) => c.name === 'last_reviewed_at')) {
     db.exec('ALTER TABLE hunts ADD COLUMN last_reviewed_at TEXT');
+  }
+  // Provenance gating: gate_version. Intentionally NO default — existing rows stay NULL and are
+  // treated as legacy (v1) by the activation gate, which grandfathers them past the B/C/D checks.
+  // Only hunts created by manage_hunt action:create get gate_version = 2 (the strict regime).
+  if (!huntCols.some((c) => c.name === 'gate_version')) {
+    db.exec('ALTER TABLE hunts ADD COLUMN gate_version INTEGER');
   }
 
   const offerCols = db.prepare("PRAGMA table_info('offers')").all() as Array<{ name: string }>;
@@ -291,6 +331,63 @@ function ensureSchema(db: Database.Database): void {
   }
   if (!huntCols.some((c) => c.name === 'poll_interval_minutes')) {
     db.exec('ALTER TABLE hunts ADD COLUMN poll_interval_minutes INTEGER');
+  }
+
+  // hunts.status: widen the CHECK constraint to allow the 'draft' lifecycle state.
+  // SQLite can't ALTER a CHECK constraint, so rebuild the table once (idempotent: only runs
+  // if the live CREATE statement doesn't already permit 'draft'). All hunts columns are
+  // guaranteed present here because the ADD COLUMN migrations above have already run.
+  const huntsTableSql = (
+    db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'hunts'").get() as
+      | { sql: string }
+      | undefined
+  )?.sql;
+  if (huntsTableSql && !huntsTableSql.includes("'draft'")) {
+    // PRAGMA foreign_keys can't be toggled inside a transaction; do it around the rebuild so
+    // child tables (market_segments, baseline_prices, hunt_log, …) keep referencing hunts(id).
+    db.pragma('foreign_keys = OFF');
+    try {
+      const rebuildHunts = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE hunts_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('draft', 'active', 'paused', 'closed')),
+            criteria TEXT NOT NULL DEFAULT '{}',
+            search_terms TEXT NOT NULL DEFAULT '[]',
+            cadence_minutes INTEGER NOT NULL DEFAULT 60,
+            monitoring INTEGER NOT NULL DEFAULT 1,
+            category_ids TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            closed_at TEXT,
+            close_reason TEXT,
+            last_reviewed_at TEXT,
+            vertical TEXT NOT NULL DEFAULT 'computers',
+            sources TEXT NOT NULL DEFAULT '["ebay"]',
+            poll_interval_minutes INTEGER,
+            gate_version INTEGER
+          );
+          INSERT INTO hunts_new (
+            id, name, status, criteria, search_terms, cadence_minutes, monitoring, category_ids,
+            created_at, closed_at, close_reason, last_reviewed_at, vertical, sources, poll_interval_minutes,
+            gate_version
+          )
+          SELECT
+            id, name, status, criteria, search_terms, cadence_minutes, monitoring, category_ids,
+            created_at, closed_at, close_reason, last_reviewed_at, vertical, sources, poll_interval_minutes,
+            gate_version
+          FROM hunts;
+          DROP TABLE hunts;
+          ALTER TABLE hunts_new RENAME TO hunts;
+        `);
+      });
+      rebuildHunts();
+      logger.info('Migrated hunts.status CHECK constraint to include draft state');
+    } finally {
+      // Always restore FK enforcement, even if the rebuild throws — otherwise a failed
+      // migration would leave foreign_keys OFF on this connection for its whole lifetime.
+      db.pragma('foreign_keys = ON');
+    }
   }
 
   // search_queries table: consecutive_failures per (hunt_id, source)

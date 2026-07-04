@@ -9,14 +9,15 @@ import PageHeader from '@/components/layout/PageHeader';
 import PipelineBar from '@/components/shared/PipelineBar';
 import StatusBadge from '@/components/shared/StatusBadge';
 import type { HuntSummary } from '@shared/types';
-import { Search, Pause, Play } from 'lucide-react';
+import { Search, Pause, Play, AlertTriangle } from 'lucide-react';
 import { toast } from 'sonner';
 import { useQueryClient } from '@tanstack/react-query';
 
-type FilterStatus = 'active' | 'paused' | 'closed' | 'all';
+type FilterStatus = 'draft' | 'active' | 'paused' | 'closed' | 'all';
 
 const filterTabs: { value: FilterStatus; label: string }[] = [
   { value: 'active', label: 'Active' },
+  { value: 'draft', label: 'Draft' },
   { value: 'paused', label: 'Paused' },
   { value: 'closed', label: 'Closed' },
   { value: 'all', label: 'All' },
@@ -33,7 +34,9 @@ export default function Hunts() {
     queryKey: [...queryKeys.hunts.all(vertical), filter],
     queryFn: () => {
       const params = new URLSearchParams();
-      if (filter !== 'active') params.set('status', filter);
+      // Always send the status explicitly — the server default now includes drafts, so the
+      // 'Active' tab must request status=active to avoid pulling in drafts/paused.
+      params.set('status', filter);
       if (vertical) params.set('vertical', vertical);
       const qs = params.toString();
       return apiGet<HuntSummary[]>(`/hunts${qs ? `?${qs}` : ''}`);
@@ -111,7 +114,7 @@ export default function Hunts() {
                   {hunt.name}
                 </span>
                 <StatusBadge
-                  variant={hunt.status as 'active' | 'paused' | 'closed'}
+                  variant={hunt.status as 'draft' | 'active' | 'paused' | 'closed'}
                 >
                   {hunt.status}
                 </StatusBadge>
@@ -120,6 +123,37 @@ export default function Hunts() {
               <div className="text-xs text-zinc-500 mb-3">
                 Created {formatRelativeTime(hunt.created_at)}
               </div>
+
+              {/* No market segments yet. For a DRAFT this is a hard blocker — the activation gate
+                  won't let it be monitored until /price-baselining records at least one segment.
+                  For an already-active/paused hunt it's a softer note (it's monitoring, but the
+                  "vs Base" comparisons aren't grounded yet). Keep the "before it can be activated"
+                  wording for drafts only so it stays honest. */}
+              {hunt.needs_baselining && (
+                <div className="flex items-center gap-1.5 text-xs text-warning bg-warning-muted rounded-md px-2 py-1 mb-3">
+                  <AlertTriangle size={12} />
+                  <span>
+                    {hunt.status === 'draft'
+                      ? 'Needs baselining before it can be activated'
+                      : 'No market baseline yet'}
+                  </span>
+                </div>
+              )}
+
+              {/* v2 feature-led provenance gates: a draft can't activate until each target has a
+                  cited spec knowledge base and every must-have is independently verified. */}
+              {hunt.needs_kb && (
+                <div className="flex items-center gap-1.5 text-xs text-warning bg-warning-muted rounded-md px-2 py-1 mb-3">
+                  <AlertTriangle size={12} />
+                  <span>Needs spec research (knowledge base) for its target models</span>
+                </div>
+              )}
+              {hunt.needs_verification && (
+                <div className="flex items-center gap-1.5 text-xs text-warning bg-warning-muted rounded-md px-2 py-1 mb-3">
+                  <AlertTriangle size={12} />
+                  <span>Needs must-have features independently verified</span>
+                </div>
+              )}
 
               {/* Pipeline */}
               <PipelineBar
@@ -167,7 +201,7 @@ export default function Hunts() {
                   {hunt.monitoring ? 'Monitoring' : 'Not monitoring'}
                 </div>
 
-                {hunt.status !== 'closed' && (
+                {(hunt.status === 'active' || hunt.status === 'paused') && (
                   <button
                     onClick={(e) => handlePauseResume(e, hunt)}
                     className="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200 transition-colors"

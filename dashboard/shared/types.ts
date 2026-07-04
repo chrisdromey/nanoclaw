@@ -3,7 +3,7 @@
 export interface Hunt {
   id: number;
   name: string;
-  status: 'active' | 'paused' | 'closed';
+  status: 'draft' | 'active' | 'paused' | 'closed';
   criteria: string; // JSON
   search_terms: string; // JSON array
   cadence_minutes: number;
@@ -111,6 +111,15 @@ export interface HuntSummary extends Hunt {
   last_searched: string | null;
   last_result_count: number | null;
   last_new_count: number | null;
+  segment_count?: number;
+  // True when a non-closed hunt has no market segments — it still needs baselining before it can
+  // be activated/monitored. Drafts surface this so a stuck hunt is visible, not silently missing.
+  needs_baselining?: boolean;
+  // v2 feature-led hunts only: the hunt is still blocked by the provenance gate because not every
+  // target has a cited spec knowledge base (needs_kb) and/or not every must-have is independently
+  // verified (needs_verification). Display hints; the gate is authoritative.
+  needs_kb?: boolean;
+  needs_verification?: boolean;
 }
 
 export interface WatchedOffer extends Offer {

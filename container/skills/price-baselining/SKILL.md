@@ -32,9 +32,14 @@ Do NOT delegate when:
 - The user asks what something sells for or whether a price is good
 - An existing baseline is stale (>14 days old)
 
-Price baselining can run alongside monitoring — you don't need to complete baselining before enabling the watcher. Start with a rough baseline from your initial market searches during requirements discovery, then deepen it as you see more listings.
+You don't need a *complete* baseline before activating — but you do need **at least one segment**, because activation is gated on it. Start with a rough baseline (even a single broad segment) from your initial market searches during requirements discovery so the hunt can activate, then deepen it as you see more listings.
 
-**Every hunt needs baselining — no exceptions.** Even if you think you know the market, your training data is stale and the market moves. More importantly, the dashboard needs market segments and baseline prices to visualise the hunt — without them, the prices page is empty. A hunt without structured baseline data is broken.
+**Every hunt needs baselining — no exceptions.** A hunt is created as a `draft` and **cannot be
+activated (monitored) until at least one market segment exists**: the `manage_hunt action:activate`
+gate refuses a hunt with zero segments. Even if you think you know the market, your training data is
+stale and the market moves. The dashboard also needs market segments and baseline prices to
+visualise the hunt — without them, the prices page is empty. A hunt with no segments stays stuck in
+`draft` and never monitors.
 
 ## Orientation
 
@@ -55,18 +60,37 @@ segment names and tags match the way the evaluator identifies offers.
 
 This is the authoritative source for price tiers — the dashboard and evaluation agent both read from here. Do not duplicate price tier numbers in the hunt markdown file.
 
-**a) Create market segments** — for each variant/grouping you identified, call `create_market_segment`:
-- `hunt_id` — the hunt you're researching
-- `name` — short descriptive name including the product/model (e.g. "Ryzen 9 5900X used", "Leaf N-Connecta"). The name is used for offer-to-segment matching alongside tags. Use the **same name** when re-researching to update rather than duplicate.
-- `tags` — JSON array of tags used to match offers to this segment. Include **both** the product/model name (so offer titles match) **and** attribute tags for filtering/consistency. Check `all_hunt_segments` in the response to see existing tags and reuse them exactly — e.g. if other segments use `"ECC-confirmed"`, use that, not `"ECC"` or `"ECC-support"`.
-- `price_low` / `price_mid` / `price_high` — your assessed price tiers. Low = good deal territory, mid = fair/typical, high = overpriced.
-- `sample_size` — how many data points informed your assessment
-- `confidence` — HIGH (20+ consistent data points), MEDIUM (10-20 or some variance), LOW (<10 or highly variable)
-- `notes` — caveats about this segment (e.g. "prices rising due to supply shortage")
+> **v2 hunts (every hunt created now): prices are DERIVED, never typed.** The price band comes from
+> the comps you record, not from your own number. The order is **bucket → record comps → derive**.
+> A price you type into a segment is ignored; the band is computed by `recompute_segment_prices` from
+> the comps in that segment. (Legacy v1 hunts still accept typed tiers — but prefer the flow below.)
 
-**b) Record baseline prices** — for the listings you used, call `record_baseline_price`:
-- `hunt_id` and `segment_name` (auto-resolves to segment_id)
-- `items` array — batch your data points. Each needs: `source_type` (sold/active/auction_completed), `title`, `price`, and optionally `shipping`, `total_landed_gbp`, `condition`, `sold_date`, `source_url`, `source_item_id`, `tags`. Record the data points that form the baseline plus any noteworthy current listings.
+**a) Bucket first.** A price only means something *within a comparable bucket* — not all Polestar 2s
+(or all 5900Xs) are the same; trim/pack/spec/condition drive the price. For a **feature-led** hunt,
+**read the knowledge base first** and define one segment per trim/variant the KB describes, so your
+buckets come from the spec research, not guesswork. Call `create_market_segment`:
+- `hunt_id`, and `name` — short, including the product/model **and trim** (e.g. "Leaf N-Connecta",
+  "Polestar 2 Long Range (2021-22)"). Name segments after a KB-covered trim/target. Reuse the **same
+  name** when re-researching to update rather than duplicate.
+- `tags` — JSON array used to match offers: include the model name **and** trim/attribute tags. Check
+  `all_hunt_segments` in the response and reuse existing tags exactly.
+- `notes` — qualitative caveats (don't put feature *claims* here; those belong in the KB).
+- (Don't bother with `price_low/mid/high`/`sample_size`/`confidence` — derived for v2.)
+
+**b) Record real comps into the right bucket** — call `record_baseline_price` with the actual
+listings you used:
+- `hunt_id` and `segment_name` (resolves to segment_id) — put each comp in the bucket it belongs to.
+- `items` array — each needs `source_type` (sold/active/auction_completed), `title`, `price`, and
+  **`source_url` + `source_item_id` + `tags` (the comp's observed trim/spec)**. For v2 these three are
+  **required in practice**: the gate only counts comps that carry a source reference and a tag — that
+  is what proves the comp is a real, deliberately-bucketed listing and not a number from memory.
+  Record ≥3 such comps per segment (more is better). Add `total_landed_gbp` where shipping/fees apply.
+
+**c) Derive the band** — call `recompute_segment_prices` (`hunt_id`, optional `segment_id`). It
+computes p25/median/p75 of the sourced comps and sets the segment's low/mid/high, sample size and
+confidence. It also returns the **within-segment spread**: if it warns the spread is too wide, your
+bucket is **mixing trims/packs** — split it into tighter segments and re-record. Re-run after adding
+comps.
 
 ## Write context to the hunt file
 
@@ -90,3 +114,5 @@ Append new sections on refresh, don't overwrite previous research. If you learne
 - Always include the product/model name in tags — tags drive offer-to-segment matching on the dashboard.
 - Use consistent segment names across research sessions for the same hunt.
 - Never skip baselining because you think you already know the prices. Your knowledge is stale; live market data is ground truth.
+- **v2 hunts: never type a price band — derive it.** Record sourced, tagged comps and run `recompute_segment_prices`. A segment with fewer than 3 sourced+tagged comps will block activation.
+- **A wide within-segment spread is a bucketing error, not a wide market.** If `recompute_segment_prices` flags it, split the segment by trim/pack — don't lower your standards to one big bucket.

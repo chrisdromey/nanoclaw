@@ -64,12 +64,23 @@ export interface SchedulerState {
   dailyApiCalls: Map<string, number>;
   dailyApiCallsResetAt: number;
   /**
-   * Consecutive failure counter per (huntId:source:terms).
+   * Consecutive *transient* failure counter per (huntId:source:terms).
    * Auto-pauses a (hunt, source, terms) after 10 consecutive failures.
    * Resets to 0 on success. Written to search_queries.consecutive_failures in DB on each failure.
    * Format: `${huntId}:${sourceId}:${terms}` → count
+   *
+   * NB: only transient failures (network/HTTP/empty-result) count here.
+   * Deterministic criteria/translation errors are surfaced separately and never
+   * burn this budget — retrying a config error can't make it self-heal.
    */
   consecutiveFailures: Map<string, number>;
+  /**
+   * Timestamp (ms) at which a (huntId:source:terms) was last auto-paused.
+   * Used to allow a periodic *probe* through `isSourcePaused` so a transient
+   * outage can self-recover without a watcher restart (see PAUSE_COOLDOWN_MS).
+   * Format: `${huntId}:${sourceId}:${terms}` → epoch ms. Cleared on success.
+   */
+  sourcePausedAt: Map<string, number>;
 }
 
 function nextMidnight(): number {
@@ -95,6 +106,7 @@ export function initState(db: Database.Database): SchedulerState {
     dailyApiCalls: new Map(),
     dailyApiCallsResetAt: nextMidnight(),
     consecutiveFailures: new Map(),
+    sourcePausedAt: new Map(),
   };
 
   const hunts = getActiveHunts(db);
@@ -116,6 +128,23 @@ export function initState(db: Database.Database): SchedulerState {
 }
 
 const CONSECUTIVE_FAILURE_PAUSE_THRESHOLD = 10;
+
+/**
+ * Cool-down before an auto-paused (hunt, source, terms) is probed again.
+ * Auto-pause is a *throttle*, not a permanent block: after this window we let a
+ * single search through, so a transient outage recovers on its own without a
+ * watcher restart. A failed probe re-arms the cool-down (see recordSourceFailure).
+ * Override with AUTO_PAUSE_COOLDOWN_MINUTES. Note the effective retry interval is
+ * max(cool-down, the hunt's poll cadence) since the cadence gate runs first.
+ */
+const PAUSE_COOLDOWN_MS = (() => {
+  const n = parseInt(process.env['AUTO_PAUSE_COOLDOWN_MINUTES'] ?? '60', 10);
+  // Clamp to >= 1 min. A 0/negative cool-down makes isSourcePaused always return false
+  // (Date.now() - pausedAt < 0 is never true), which disables the throttle entirely and
+  // lets a failing source hammer every tick — the opposite of what the override should do.
+  const minutes = isNaN(n) ? 60 : Math.max(1, n);
+  return minutes * 60_000;
+})();
 
 /** Max detail fetches per tick per hunt (per source with needsDetailFetch). */
 const MAX_DETAIL_FETCHES_PER_TICK = (() => {
@@ -149,9 +178,12 @@ function recordSourceFailure(
   `).run(next, huntId, sourceId, terms);
 
   if (next >= CONSECUTIVE_FAILURE_PAUSE_THRESHOLD) {
+    // (Re-)arm the cool-down clock. A probe that fails lands back here and pushes
+    // the next probe out by another PAUSE_COOLDOWN_MS rather than blocking forever.
+    state.sourcePausedAt.set(key, Date.now());
     logger.warn(
-      { huntId, sourceId, terms, consecutiveFailures: next },
-      'Source auto-paused after 10 consecutive failures — fix the adapter or re-enable manually by restarting the watcher',
+      { huntId, sourceId, terms, consecutiveFailures: next, retryAfterMinutes: PAUSE_COOLDOWN_MS / 60_000 },
+      'Source auto-paused after 10 consecutive failures — will auto-probe after the cool-down; fix the adapter to recover sooner',
     );
     return true;
   }
@@ -168,6 +200,7 @@ function clearSourceFailures(
 ): void {
   const key = `${huntId}:${sourceId}:${terms}`;
   state.consecutiveFailures.set(key, 0);
+  state.sourcePausedAt.delete(key);
 
   // Clear in DB for observability
   db.prepare(`
@@ -177,10 +210,20 @@ function clearSourceFailures(
   `).run(huntId, sourceId, terms);
 }
 
-/** Returns true if source has been auto-paused (consecutive_failures >= threshold in state). */
+/**
+ * Returns true if the source is currently auto-paused for this (hunt, source, terms).
+ * Auto-pause is recoverable: once it has been paused for at least PAUSE_COOLDOWN_MS
+ * we return false to let a single probe search through. If the probe succeeds,
+ * clearSourceFailures resets the counter; if it fails, recordSourceFailure re-arms
+ * the cool-down. This lets a transient outage heal without a watcher restart.
+ */
 function isSourcePaused(state: SchedulerState, huntId: number, sourceId: string, terms: string): boolean {
   const key = `${huntId}:${sourceId}:${terms}`;
-  return (state.consecutiveFailures.get(key) ?? 0) >= CONSECUTIVE_FAILURE_PAUSE_THRESHOLD;
+  if ((state.consecutiveFailures.get(key) ?? 0) < CONSECUTIVE_FAILURE_PAUSE_THRESHOLD) return false;
+
+  const pausedAt = state.sourcePausedAt.get(key) ?? 0;
+  // Cool-down elapsed → allow one probe this tick (don't treat as paused).
+  return Date.now() - pausedAt < PAUSE_COOLDOWN_MS;
 }
 
 export async function tick(state: SchedulerState, db: Database.Database): Promise<void> {
@@ -251,18 +294,42 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
           continue;
         }
 
-        try {
-          // Load the per-(vertical, source) translator from the registry.
-          const translator = getTranslator(hunt.vertical, sourceId);
-          if (!translator) {
-            logger.warn(
-              { huntId: hunt.id, vertical: hunt.vertical, sourceId },
-              'No translator registered for vertical/source pair — skipping',
-            );
-            continue;
-          }
+        // --- Translate criteria → native params (deterministic / config step) ---
+        // Kept in its own try/catch, separate from the network search below: a
+        // translator throw is a config/criteria error (e.g. missing make/postcode)
+        // that will throw identically on every retry. Counting it toward the
+        // transient auto-pause budget just silently disables the source after 10
+        // pointless retries. Instead we surface it distinctly and back off to the
+        // hunt's normal cadence (set lastSearchTime) so it's logged once per poll,
+        // not every tick — and it self-heals the moment the criteria is fixed.
+        const translator = getTranslator(hunt.vertical, sourceId);
+        if (!translator) {
+          logger.warn(
+            { huntId: hunt.id, vertical: hunt.vertical, sourceId },
+            'No translator registered for vertical/source pair — skipping',
+          );
+          // Deterministic config error (same class as a translator throw): a missing
+          // translator won't appear by retrying. Back off to the hunt's cadence so we
+          // log it once per poll, not every 30s tick, and self-heal once one is registered.
+          state.lastSearchTime.set(key, Date.now());
+          continue;
+        }
 
-          const nativeParams = translator(hunt, terms);
+        let nativeParams: unknown;
+        try {
+          nativeParams = translator(hunt, terms);
+        } catch (translateErr) {
+          logger.error(
+            { huntId: hunt.id, sourceId, terms, err: translateErr },
+            'Search skipped: criteria/translation error (config — not a transient failure). ' +
+              'Not counted toward auto-pause; fix the hunt criteria. Will retry next poll.',
+          );
+          state.lastSearchTime.set(key, Date.now());
+          continue;
+        }
+
+        // --- Search (transient / network step) ---
+        try {
           const outcome = await adapter.search(nativeParams);
           addSourceCalls(state, sourceId, outcome.apiCalls);
 
@@ -341,6 +408,14 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
           if (paused) {
             logger.warn({ huntId: hunt.id, sourceId }, 'Source auto-paused due to repeated failures');
           }
+          // Advance lastSearchTime even on a thrown search, for parity with every other
+          // outcome branch (success, zero-listings-with-errors, config/translate error).
+          // Without this a transiently-failing source (network/429/5xx) would stay eligible
+          // every 30s tick — ignoring the hunt's poll cadence — until it accrued 10 failures.
+          // Now it backs off to max(cadence, cool-down). recordSourceFailure still runs above,
+          // so the transient failure is still counted toward auto-pause; and the cool-down
+          // probe logic is unaffected (isSourcePaused gates separately on sourcePausedAt).
+          state.lastSearchTime.set(key, Date.now());
         }
       }
     }

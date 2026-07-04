@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { getDealDb } from '../db.js';
+import { computeReadiness } from '../hunt-readiness.js';
 
 export const overviewRoutes = new Hono();
 
@@ -13,10 +14,13 @@ overviewRoutes.get('/dashboard/overview', (c) => {
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'new') as new_count,
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'evaluated') as evaluated_count,
         (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'watching') as watching_count,
-        (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'dismissed') as dismissed_count
+        (SELECT COUNT(*) FROM hunt_offers ho WHERE ho.hunt_id = h.id AND ho.status = 'dismissed') as dismissed_count,
+        (SELECT COUNT(*) FROM market_segments ms WHERE ms.hunt_id = h.id) as segment_count,
+        (SELECT COUNT(*) FROM knowledge_base kb WHERE kb.hunt_id = h.id) as kb_count,
+        (SELECT COUNT(*) FROM claim_verifications cv WHERE cv.hunt_id = h.id AND cv.verdict = 'verified') as verified_count
       FROM hunts h
-      WHERE h.status IN ('active', 'paused')
-      ORDER BY CASE h.status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 END, h.created_at DESC`,
+      WHERE h.status IN ('draft', 'active', 'paused')
+      ORDER BY CASE h.status WHEN 'draft' THEN 0 WHEN 'active' THEN 1 WHEN 'paused' THEN 2 END, h.created_at DESC`,
     )
     .all() as Array<Record<string, unknown>>;
 
@@ -67,6 +71,14 @@ overviewRoutes.get('/dashboard/overview', (c) => {
       last_searched: search?.last_searched ?? null,
       last_result_count: search?.last_result_count ?? null,
       last_new_count: search?.last_new_count ?? null,
+      ...computeReadiness(
+        { status: h.status as string, criteria: h.criteria as string, gate_version: h.gate_version as number | null },
+        {
+          segment_count: (h.segment_count as number) ?? 0,
+          kb_count: (h.kb_count as number) ?? 0,
+          verified_count: (h.verified_count as number) ?? 0,
+        },
+      ),
     };
   });
 

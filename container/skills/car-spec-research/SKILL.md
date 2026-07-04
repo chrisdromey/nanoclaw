@@ -66,6 +66,23 @@ For each candidate without a current KB, research it to the trim/pack/year level
 
 Write to `references/product-knowledge/cars/{make}-{model}.md` using the template below. Follow the `/documentation` conventions: factual, scannable, dated, append/extend rather than overwrite. Every non-obvious claim should trace to a source URL in the Sources section.
 
+### 4b. Register KB coverage in the DB (so the hunt can activate)
+
+A feature-led hunt is gated on cited KB coverage — the activation gate (which only sees the database,
+not the KB files) blocks until each target model has a coverage record proving its must-haves are
+cited. After writing the KB file, call `mcp__deal-hunter-db__record_kb_coverage` once per target:
+- `hunt_id`, `target_key` (the exact `criteria.targets` key, e.g. `"Polestar 2"`), `kb_path` (the file
+  you just wrote).
+- `must_have_citations` — a map from each of the hunt's `intent.must_have` features to the number of
+  **distinct source URLs** in the KB that substantiate it for this model, e.g.
+  `{"Adaptive cruise control (ACC)": 2, "Lane keep / lane centering": 1}`. Every must-have needs ≥1
+  cited source or the gate blocks — so if you couldn't cite one, that's a research gap to close, not a
+  number to inflate. The strings must match the hunt's `must_have` entries verbatim.
+
+Recording coverage is **not** the same as verification — an independent verifier re-checks the
+must-haves separately (`/musthave-verification`). Coverage says "the KB cites this"; verification says
+"an independent source confirms it". Both are required before activation.
+
 ### 5. Assemble the cross-model shortlist
 
 With KBs in hand, write the hunt's `## Research Summary` (per `/research` step 7): the ranked candidate models/trims for *this* brief, the feature × candidate comparison, the trade-offs, and the target/reject guidance — each pointing back to the relevant KB file for detail. Recommend hunt criteria and search terms but don't change the hunt without the user's agreement.

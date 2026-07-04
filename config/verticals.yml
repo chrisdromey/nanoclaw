@@ -37,17 +37,36 @@ cars:
   recon_tool: mcp__autotrader-search__autotrader_search
   knowledge_base_path: references/product-knowledge/cars/{make}-{model}.md
   sources: [autotrader]
-  default_poll_minutes: 360  # 6h — cars don't move quickly
+  default_poll_minutes: 1440  # 24h — car listings change slowly; daily recheck is enough
+  # A cars hunt is a WIDE NET cast across one or more candidate models that share
+  # the same budget/location/mileage/fuel. The watcher searches each model with
+  # ONLY the filters AutoTrader supports (below); everything judgement-based lives
+  # in `intent` and is applied AFTER the search by the car-listing-evaluation
+  # skill. The search over-returns on purpose — the evaluator triages.
   criteria_schema:
-    make: string
-    model: string
-    year_min: integer?
-    year_max: integer?
-    max_price: integer?
-    max_mileage: integer?
-    postcode: string
-    fuel: string?
-    transmission: string?
+    # shared — applied to EVERY model's search. These are the searchable, hunt-wide constraints.
+    shared:
+      postcode: string
+      max_price: integer?
+      max_mileage: integer?
+      fuel: string?          # AutoTrader fuel_type, e.g. "Electric", "Petrol"
+      transmission: string?
+    # targets — one entry per candidate model, keyed by the matching search_terms string.
+    # Only the fields here are searchable per-model. search_terms MUST use these same keys.
+    targets:
+      "<search term, e.g. 'Jaguar I-Pace'>":
+        make: string
+        model: string?
+        year_min: integer?
+        year_max: integer?
+    # intent — EVALUATOR-ONLY. The search NEVER reads this. Put everything AutoTrader
+    # cannot filter here: must-have features, trim/pack minimums, reject rules, per-model notes.
+    intent:
+      must_have: string[]?
+      nice_to_have: string[]?
+      reject: string[]?
+      notes_by_model: object?   # { "<search term>": "free-text trim/feature guidance" }
+      purpose: string?
   notification_formatter: cars
   attributes_required:
     - year

@@ -8,6 +8,17 @@ allowed-tools: mcp__deal-hunter-db__*, mcp__autotrader-search__*
 
 T3 (bespoke) evaluator for the `cars` vertical. Uses the AutoTrader price-tier signal as the primary deal indicator, with spec-comparable search for confirmation.
 
+## The search is a coarse net — you do the real filtering
+
+The watcher's search is a **wide net, not a precise match.** It can only filter on what
+AutoTrader has filters for: **make, model, year, price, mileage, fuel, transmission, postcode**
+(the hunt's `criteria.shared` + `criteria.targets`). Every other requirement in the brief —
+**must-have features, trim/pack minimums, reject rules, per-model notes** — lives in
+`criteria.intent` and was **NOT** applied by the search. Assume the offers you're handed include
+plenty of cars that clear budget and model but fail the brief on spec. Triaging them against
+`intent` is *your* job; the search deliberately over-returned so you wouldn't miss a good car
+hiding behind a vague listing. Do not treat a returned listing as "already a match".
+
 ## Delegation
 
 When this skill is triggered from an interactive chat session (user message, not a scheduled task), delegate to the `cars-evaluator` sub-agent instead of doing the work inline. This keeps the chat context lean.
@@ -31,7 +42,13 @@ Do NOT delegate when:
 
 ## Orientation
 
-1. `mcp__deal-hunter-db__get_hunt_summary` — hunt criteria (make, model, year_min/max, max_price, max_mileage, postcode, fuel, transmission), market segments, watched offers
+1. `mcp__deal-hunter-db__get_hunt_summary` — hunt criteria, market segments, watched offers.
+   Cars criteria has three zones: `shared` (hunt-wide searchable: postcode/budget/mileage/fuel),
+   `targets` (per-model searchable: make/model/year, keyed by search term), and **`intent`** —
+   the evaluator-only requirements (`must_have`, `nice_to_have`, `reject`, `notes_by_model`,
+   `purpose`). **Read `intent` first** — it is the spec the search could not enforce and the
+   yardstick for every ALERT/WATCH/SKIP. (Older hunts may store a flat criteria object instead;
+   fall back to the hunt markdown for must-haves there.)
 2. Read `references/hunts/{hunt}.md` — strategy notes, the brief's must-have features, known good examples, rejection patterns
 3. Read the model's trim knowledge base, `references/product-knowledge/cars/{make}-{model}.md`, if it exists — the trim ladder, feature-by-trim matrix, and the "verify on a listing" cues. This is your reference for mapping a listing to its trim and confirming features. If a candidate model has no KB and the brief turns on features, flag it — `/car-spec-research` should build one rather than you guessing.
 4. Read `references/preferences.md` if it exists — buyer preferences (e.g. private-only, service-history requirements, colour avoidance)
@@ -52,7 +69,7 @@ Most listings should be resolved in pass 1 — only the genuinely promising ones
 - `attention_grabber` — the seller's free-text highlights, often naming exact extras (e.g. "2OWNERS+PARKAID+CRUISE+SAT-NAV", "Virtual Cockpit|Heated Seats")
 - `price`, `year`, `distance_miles`
 
-The free text is messy and inconsistent — that's fine, use your judgement (this is exactly what you're good at). `mcp__deal-hunter-db__batch_dismiss` the obvious misfits: wrong trim/variant for the brief, wrong body style, too old, over budget, too far with no collection plan. Don't open a detail page to reject something you can already tell is wrong from the row.
+The free text is messy and inconsistent — that's fine, use your judgement (this is exactly what you're good at). `mcp__deal-hunter-db__batch_dismiss` the obvious misfits: anything matching `intent.reject`, wrong trim/variant for the brief, wrong body style, too old, over budget, too far with no collection plan. Apply `intent.notes_by_model[<this term>]` here too — it carries the per-model trim/pack guidance for exactly the model this row is. Don't open a detail page to reject something you can already tell is wrong from the row.
 
 `price_tier` is usually absent at this stage (it lives on the detail page) — it is NOT the triage signal here; you'll get it in Step 2. Keep every listing that plausibly fits the brief and could be a good buy.
 

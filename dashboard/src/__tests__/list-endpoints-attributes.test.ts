@@ -67,6 +67,12 @@ beforeEach(() => {
       total_landed_gbp REAL,
       observed_at TEXT
     );
+    CREATE TABLE market_segments (
+      id INTEGER PRIMARY KEY,
+      hunt_id INTEGER
+    );
+    CREATE TABLE knowledge_base (id INTEGER PRIMARY KEY, hunt_id INTEGER);
+    CREATE TABLE claim_verifications (id INTEGER PRIMARY KEY, hunt_id INTEGER, verdict TEXT);
   `);
 
   db.prepare('INSERT INTO hunts (id, name, vertical, sources) VALUES (?, ?, ?, ?)')

@@ -52,20 +52,25 @@ registerTranslator('computers', 'ebay', ebayComputersTranslator);
 // source will be skipped with a descriptive error logged by the scheduler.
 import type { CarsCriteria } from '../../../verticals/dist/cars/translators/autotrader.js';
 
-let _carsAtTranslator: ((criteria: CarsCriteria) => unknown) | undefined;
+let _carsAtTranslator: ((criteria: CarsCriteria, terms: string) => unknown) | undefined;
 
-async function loadCarsAtTranslator(): Promise<((criteria: CarsCriteria) => unknown) | undefined> {
+async function loadCarsAtTranslator(): Promise<
+  ((criteria: CarsCriteria, terms: string) => unknown) | undefined
+> {
   if (_carsAtTranslator !== undefined) return _carsAtTranslator;
   try {
     const mod = await import('../../../verticals/dist/cars/translators/autotrader.js');
-    _carsAtTranslator = mod.translateCarsCriteriaToAutotrader as (criteria: CarsCriteria) => unknown;
+    _carsAtTranslator = mod.translateCarsCriteriaToAutotrader as (
+      criteria: CarsCriteria,
+      terms: string,
+    ) => unknown;
     return _carsAtTranslator;
   } catch {
     return undefined;
   }
 }
 
-const carsAutotraderTranslator: TranslatorFn = (hunt, _terms) => {
+const carsAutotraderTranslator: TranslatorFn = (hunt, terms) => {
   // Criteria is stored as JSON in hunt.criteria
   let criteria: CarsCriteria;
   try {
@@ -82,7 +87,10 @@ const carsAutotraderTranslator: TranslatorFn = (hunt, _terms) => {
     throw new Error('cars/autotrader translator: module not yet loaded — will retry next tick');
   }
 
-  return _carsAtTranslator(criteria);
+  // `terms` selects which candidate model (criteria.targets[terms]) this search
+  // is for; the scheduler calls us once per search term, fanning one hunt across
+  // its models.
+  return _carsAtTranslator(criteria, terms);
 };
 
 registerTranslator('cars', 'autotrader', carsAutotraderTranslator);

@@ -1,6 +1,7 @@
 import { cn } from '@/lib/utils';
 
 export type BadgeVariant =
+  | 'draft'
   | 'active'
   | 'paused'
   | 'closed'
@@ -24,6 +25,7 @@ export type BadgeVariant =
 
 const variantStyles: Record<BadgeVariant, string> = {
   // Hunt status
+  draft: 'bg-info-muted text-info',
   active: 'bg-success-muted text-success',
   paused: 'bg-warning-muted text-warning',
   closed: 'bg-zinc-800 text-zinc-400',

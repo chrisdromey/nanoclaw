@@ -18,6 +18,10 @@ import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+// Single source of truth for AutoTrader filter NAMES + per-filter build, vendored
+// byte-identical from verticals/cars/translators/autotrader-filters.ts so this
+// recon path and the watcher translator can't drift (see that file's header).
+import { buildAutotraderFilters } from './autotrader-filters.js';
 
 // --- Constants ---
 
@@ -194,22 +198,17 @@ async function searchAT(opts: {
   page?: number;
   sortBy?: string;
 }): Promise<{ listings: SlimATListing[]; total: number; page: number; error?: string }> {
-  const filters: FilterInput[] = [
-    { filter: 'make', selected: [opts.make] },
-  ];
-
-  if (opts.model) filters.push({ filter: 'model', selected: [opts.model] });
-  if (opts.year_min != null) filters.push({ filter: 'min_year', selected: [String(opts.year_min)] });
-  if (opts.year_max != null) filters.push({ filter: 'max_year', selected: [String(opts.year_max)] });
-  if (opts.max_price != null) filters.push({ filter: 'max_price', selected: [String(opts.max_price)] });
-  if (opts.max_mileage != null) filters.push({ filter: 'maximum_mileage', selected: [String(opts.max_mileage)] });
-
-  filters.push({ filter: 'postcode', selected: [opts.postcode] });
-  filters.push({ filter: 'price_search_type', selected: ['total'] });
-  filters.push({ filter: 'home_delivery_adverts', selected: ['include'] });
-
-  if (opts.fuel) filters.push({ filter: 'fuel-type', selected: [opts.fuel] });
-  if (opts.transmission) filters.push({ filter: 'transmission', selected: [opts.transmission] });
+  const filters: FilterInput[] = buildAutotraderFilters({
+    make: opts.make,
+    model: opts.model,
+    year_min: opts.year_min,
+    year_max: opts.year_max,
+    max_price: opts.max_price,
+    max_mileage: opts.max_mileage,
+    postcode: opts.postcode,
+    fuel: opts.fuel,
+    transmission: opts.transmission,
+  });
 
   const payload = [
     {
@@ -511,7 +510,7 @@ server.tool(
       .describe('Transmission type, e.g. "Automatic", "Manual"'),
     page: z.number().min(1).default(1).describe('Page number (20 results per page)'),
     sort_by: z
-      .enum(['relevance', 'price-asc', 'distance'])
+      .enum(['relevance', 'price_asc', 'price_desc', 'distance'])
       .optional()
       .describe('Sort order (default: relevance)'),
     limit: z
@@ -556,6 +555,38 @@ server.tool(
       return errorResult(result.error);
     }
 
+    // Silent-zero diagnostic. AutoTrader's `model` filter is an exact enum match:
+    // a wrong model string (e.g. "2" instead of Polestar's "Polestar 2") returns
+    // zero rather than erroring, which is indistinguishable from "none in budget".
+    // When a model was given and nothing matched, re-run the SAME search minus the
+    // model. If the make (with every other constraint held) still has listings, the
+    // model string is almost certainly the culprit — surface that so the agent can
+    // correct it instead of concluding the car doesn't exist.
+    let modelMismatchWarning: string | undefined;
+    if (model && result.total === 0 && !result.error) {
+      const makeOnly = await searchAT({
+        make,
+        postcode,
+        max_price,
+        max_mileage,
+        year_min,
+        year_max,
+        fuel,
+        transmission,
+        page: 1,
+        sortBy: sort_by,
+      });
+      if (makeOnly.total > 0) {
+        modelMismatchWarning =
+          `Model "${model}" returned 0 results for make "${make}", but the same search ` +
+          `without the model filter has ${makeOnly.total} listings. AutoTrader matches the ` +
+          `model filter against fixed enum values, so the model name likely doesn't match ` +
+          `exactly (e.g. Polestar's is "Polestar 2", not "2"). Re-run as a make-only search, ` +
+          `read the exact model string off the returned listings, and retry with that value.`;
+        log(`model mismatch: "${make}"/"${model}" -> 0, make-only -> ${makeOnly.total}`);
+      }
+    }
+
     const effectiveLimit = limit ?? DEFAULT_MAX_RESULTS;
     const sliced = result.listings.slice(0, effectiveLimit);
 
@@ -566,6 +597,7 @@ server.tool(
       note: 'Price tier (Great/Good/Lower price) requires a detail-page fetch per listing and is not included here. Use the watcher\'s fetchDetail() for enriched data.',
       listings: sliced,
       ...(result.error ? { warning: result.error } : {}),
+      ...(modelMismatchWarning ? { model_mismatch_warning: modelMismatchWarning } : {}),
     });
   },
 );
