@@ -57,12 +57,14 @@ For each remaining offer:
 1. **Check if previously evaluated** — `mcp__deal-hunter-db__get_offer` for full details + last evaluation. Use `get_offer_history` if you need price trends. If nothing changed, skip.
 2. **Calculate true landed cost** — item + shipping. Non-UK sellers: add duty + 20% VAT.
 3. **Evaluate against criteria and baseline** — does it meet requirements? How does the price compare to what you know from the hunt file's price research?
-4. **Assess urgency** — auction ending soon is urgent, stable BIN is not.
-5. **Decide** — ALERT (good match at good value), WATCH (interesting but not quite right), or SKIP (overpriced, poor match).
-6. **Record** — `mcp__deal-hunter-db__record_evaluation`, and `record_alert` if alerting.
-7. **If WATCH** — enable offer monitoring by calling `mcp__deal-hunter-db__update_offer` with `watching: true` and `watch_conditions` JSON. The background watcher polls watched offers every 2 hours and triggers an urgent agent invocation when conditions are met. Example conditions:
+4. **Verify hard requirements (feature-led hunts)** — if the hunt's `criteria.intent.must_have` is non-empty, confirm each entry against THIS listing's item specifics and description (via `getItem`): present → `verified`; meaningfully absent (e.g. spec sheet shows QLC where TLC is required) → `contradicted`; genuinely can't tell → `unverified`, never a guess. You'll record these per-requirement verdicts in step 7.
+5. **Assess urgency** — auction ending soon is urgent, stable BIN is not.
+6. **Decide** — ALERT (good match at good value), WATCH (interesting but not quite right), or SKIP (overpriced, poor match).
+7. **Record** — `mcp__deal-hunter-db__record_evaluation`, passing step-4 verdicts as `requirement_checks` (quote the `must_have` strings **verbatim** — exact match, not a paraphrase). On a feature-led hunt, ALERT requires a check for every must-have and is refused if any is `contradicted`. Call `record_alert` if alerting.
+8. **If WATCH** — enable offer monitoring by calling `mcp__deal-hunter-db__update_offer` with `watching: true` and `watch_conditions` JSON. The background watcher polls watched offers and triggers an urgent agent invocation when conditions are met. Canonical keys (anything else is ignored by the watcher):
    - `{"alert_if_price_below_gbp": 150}` — price drops below threshold
    - `{"max_price": 200}` — price at or below maximum
+   - `verify_required` (string[]) — the unverified must-haves; auto-populated by `record_evaluation` when you watch with unverified checks, don't hand-write it
    - The watcher alerts at graduated thresholds when a watched auction has 24h, 12h, or 6h remaining. Offer removals/endings are picked up in the daily review via `status_changes`.
 
 ## Alert format

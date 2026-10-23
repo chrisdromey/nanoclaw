@@ -17,6 +17,8 @@ import {
   evaluateActivationGate,
   validateCriteriaForVertical,
   enumerateHuntTargetKeys,
+  huntMustHaves,
+  huntNiceToHaves,
   type HuntRow,
 } from './deal-hunter-gate.js';
 
@@ -86,6 +88,101 @@ function validateTargetKeyForHunt(huntId: number, targetKey: string): string | n
     `${res.keys.map((k) => `"${k}"`).join(', ')}. Pass one of these verbatim (the full criteria key, ` +
     `e.g. "Kia EV6" — not a shortened alias like "EV6").`
   );
+}
+
+// --- Per-offer requirement checks (record_evaluation) ---
+
+interface RequirementCheckInput {
+  requirement: string;
+  verdict: 'verified' | 'unverified' | 'contradicted';
+  evidence: string;
+}
+
+type RequirementCheckStored = RequirementCheckInput & { tier: 'must' | 'nice' };
+
+// Validate record_evaluation's requirement_checks against the hunt's criteria and enforce the
+// alert gate. Mirrors validateTargetKeyForHunt's exact-string discipline: a check is counted by
+// verbatim match against intent.must_have / intent.nice_to_have, so a paraphrase satisfies
+// nothing. Enforcement applies only to feature-led hunts (non-empty must_have) — legacy hunts
+// with no intent zone are unaffected. Returns an error string (write must be refused) or the
+// normalized checks (tier derived) ready to persist.
+function validateRequirementChecks(
+  huntId: number,
+  decision: 'alert' | 'skip' | 'watch',
+  checks: RequirementCheckInput[] | undefined,
+): { error: string } | { normalized: RequirementCheckStored[] | null } {
+  const hunt = db.prepare('SELECT criteria FROM hunts WHERE id = ?').get(huntId) as
+    | { criteria: string | null }
+    | undefined;
+  if (!hunt) return { error: `Hunt not found: ${huntId}` };
+
+  let criteria: unknown = null;
+  try {
+    criteria = hunt.criteria ? JSON.parse(hunt.criteria) : null;
+  } catch {
+    // Unparseable criteria: treat as not feature-led (matches the gate's grandfathering) —
+    // but refuse checks we cannot anchor to anything.
+    if (checks && checks.length > 0) {
+      return {
+        error: `Hunt ${huntId}'s criteria is not valid JSON — requirement_checks cannot be validated against it. Fix the criteria via manage_hunt first.`,
+      };
+    }
+    return { normalized: null };
+  }
+
+  const must = huntMustHaves(criteria);
+  const nice = huntNiceToHaves(criteria);
+
+  const normalized: RequirementCheckStored[] = [];
+  const seen = new Set<string>();
+  for (const check of checks ?? []) {
+    if (seen.has(check.requirement)) {
+      return { error: `Duplicate requirement_check for "${check.requirement}" — pass one check per requirement.` };
+    }
+    seen.add(check.requirement);
+    if (must.includes(check.requirement)) {
+      normalized.push({ ...check, tier: 'must' });
+    } else if (nice.includes(check.requirement)) {
+      normalized.push({ ...check, tier: 'nice' });
+    } else {
+      const valid = [...must, ...nice];
+      return {
+        error:
+          `Invalid requirement "${check.requirement}" for hunt ${huntId}. Per-offer checks are counted by ` +
+          `exact string match against the hunt's criteria.intent.must_have / nice_to_have, so a paraphrase ` +
+          `satisfies nothing. ` +
+          (valid.length > 0
+            ? `Valid requirements: ${valid.map((s) => `"${s}"`).join(', ')}. Pass one of these verbatim.`
+            : `This hunt declares no intent.must_have / nice_to_have entries — omit requirement_checks. ` +
+              `(If this hunt predates the intent.must_have convention, update its criteria via manage_hunt first.)`),
+      };
+    }
+  }
+
+  // Alert gate — feature-led hunts only.
+  if (decision === 'alert' && must.length > 0) {
+    const covered = new Set(normalized.filter((c) => c.tier === 'must').map((c) => c.requirement));
+    const missing = must.filter((m) => !covered.has(m));
+    if (missing.length > 0) {
+      return {
+        error:
+          `decision "alert" requires a requirement_check for every must_have entry. Missing: ` +
+          `${missing.map((s) => `"${s}"`).join(', ')}. Verify each against this listing's evidence and ` +
+          `record verified/unverified/contradicted — or record watch/skip instead.`,
+      };
+    }
+    const contradicted = normalized.find((c) => c.tier === 'must' && c.verdict === 'contradicted');
+    if (contradicted) {
+      return {
+        error:
+          `Cannot alert: must-have "${contradicted.requirement}" is contradicted by the listing evidence ` +
+          `("${contradicted.evidence}"). A failed hard requirement is a skip (or a watch, if the evidence ` +
+          `itself is doubtful) — not an alert.`,
+      };
+    }
+  }
+
+  return { normalized: normalized.length > 0 ? normalized : null };
 }
 
 // p25 / median / p75 of a numeric sample (linear interpolation), or null for an empty sample.
@@ -396,8 +493,39 @@ server.tool(
 
     const CRITERIA_CAP_CHARS = 4096;
     if (typeof hunt.criteria === 'string' && hunt.criteria.length > CRITERIA_CAP_CHARS) {
-      hunt.criteria = hunt.criteria.slice(0, CRITERIA_CAP_CHARS);
-      hunt.criteria_truncated = `criteria truncated at ${CRITERIA_CAP_CHARS} chars — call get_hunt(${hunt_id}) for the full criteria`;
+      // intent (must_have / reject / notes_by_model) is the evaluator's yardstick and sits LAST
+      // in the criteria JSON, so a naive prefix cut drops exactly the part evaluation depends on.
+      // Rebuild with intent kept whole (soft cap), then fill remaining keys in original order.
+      let rebuilt: string | null = null;
+      let omitted: string[] = [];
+      try {
+        const parsed = JSON.parse(hunt.criteria);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const kept: Record<string, unknown> = {};
+          if ('intent' in parsed) kept.intent = parsed.intent;
+          for (const key of Object.keys(parsed)) {
+            if (key === 'intent') continue;
+            const candidate = { ...kept, [key]: parsed[key] };
+            if (JSON.stringify(candidate).length <= CRITERIA_CAP_CHARS) {
+              kept[key] = parsed[key];
+            } else {
+              omitted.push(key);
+            }
+          }
+          rebuilt = JSON.stringify(kept);
+        }
+      } catch {
+        // Not valid JSON — fall through to the prefix slice
+      }
+      if (rebuilt !== null) {
+        hunt.criteria = rebuilt;
+        hunt.criteria_truncated = omitted.length > 0
+          ? `criteria over ${CRITERIA_CAP_CHARS} chars — intent kept in full; omitted keys: ${omitted.join(', ')}. Call get_hunt(${hunt_id}) for the full criteria`
+          : `criteria over ${CRITERIA_CAP_CHARS} chars — reordered with intent first, nothing omitted`;
+      } else {
+        hunt.criteria = hunt.criteria.slice(0, CRITERIA_CAP_CHARS);
+        hunt.criteria_truncated = `criteria (not valid JSON) truncated at ${CRITERIA_CAP_CHARS} chars — call get_hunt(${hunt_id}) for the full criteria`;
+      }
     }
 
     const newOffers = since
@@ -749,7 +877,7 @@ server.tool(
     source_id: z.string().optional(),
     status: z.enum(['active', 'ended', 'removed', 'sold']).optional(),
     watching: z.boolean().optional(),
-    watch_conditions: z.string().optional().describe('JSON string'),
+    watch_conditions: z.string().optional().describe('JSON string. Canonical keys: alert_if_price_below_gbp (number), max_price (number), verify_required (string[] of unverified must-have requirements — auto-populated by record_evaluation on watch; carried over from the existing conditions unless you explicitly set or clear it).'),
     attributes: z.record(z.string(), z.unknown()).optional().describe('Structured source attributes object (stored as JSON). Powers list_offers triage columns — e.g. for cars: subTitle, attentionGrabber, year, distance_miles, price_tier.'),
     vertical: z.string().optional().describe("Vertical this offer belongs to, e.g. 'computers' or 'cars'."),
     hunt_id: z.number().optional().describe('If provided with hunt_offer_status, updates the hunt_offer'),
@@ -771,7 +899,30 @@ server.tool(
       sets.push('watching = ?'); params.push(args.watching ? 1 : 0);
       if (!args.watching) { sets.push("notified_thresholds = '[]'"); }
     }
-    if (args.watch_conditions !== undefined) { sets.push('watch_conditions = ?'); params.push(args.watch_conditions); }
+    if (args.watch_conditions !== undefined) {
+      // Preserve verify_required (auto-populated by record_evaluation) unless the caller
+      // explicitly sets or clears it — a routine price-threshold update must not silently
+      // drop the "confirm this must-have" flag.
+      let newConditions = args.watch_conditions;
+      try {
+        const incoming = JSON.parse(args.watch_conditions);
+        if (incoming && typeof incoming === 'object' && !Array.isArray(incoming) && !('verify_required' in incoming)) {
+          const row = db.prepare('SELECT watch_conditions FROM offers WHERE id = ?').get(offerId) as
+            | { watch_conditions: string | null }
+            | undefined;
+          if (row?.watch_conditions) {
+            const existing = JSON.parse(row.watch_conditions);
+            if (existing && typeof existing === 'object' && Array.isArray(existing.verify_required) && existing.verify_required.length > 0) {
+              incoming.verify_required = existing.verify_required;
+              newConditions = JSON.stringify(incoming);
+            }
+          }
+        }
+      } catch {
+        // Either value isn't valid JSON — store the caller's value as-is (matches prior behavior)
+      }
+      sets.push('watch_conditions = ?'); params.push(newConditions);
+    }
     if (args.attributes !== undefined) { sets.push('attributes = ?'); params.push(JSON.stringify(args.attributes)); }
     if (args.vertical !== undefined) { sets.push('vertical = ?'); params.push(args.vertical); }
 
@@ -976,19 +1127,37 @@ server.tool(
 // ============================================================
 server.tool(
   'record_evaluation',
-  'Record an evaluation decision for an offer against a hunt. Updates hunt_offer status accordingly. Watch decision sets offer.watching=1.',
+  'Record an evaluation decision for an offer against a hunt. Updates hunt_offer status accordingly. Watch decision sets offer.watching=1. For feature-led hunts (criteria.intent.must_have non-empty), decision "alert" REQUIRES requirement_checks covering every must_have entry (verbatim strings) and is refused if any is contradicted — a failed hard requirement is a skip, not an alert. A watch with unverified checks auto-populates watch_conditions.verify_required on the offer.',
   {
     offer_id: z.number(),
     hunt_id: z.number(),
     decision: z.enum(['alert', 'skip', 'watch']),
     reasoning: z.string(),
+    requirement_checks: z
+      .array(
+        z.object({
+          requirement: z
+            .string()
+            .describe("Verbatim entry from the hunt's criteria.intent.must_have (or nice_to_have) — exact string, not a paraphrase"),
+          verdict: z.enum(['verified', 'unverified', 'contradicted']),
+          evidence: z
+            .string()
+            .describe('What in THIS listing supports the verdict — e.g. the equipment-list entry, or its absence'),
+        }),
+      )
+      .optional()
+      .describe('Per-requirement verdicts for this specific listing. Required (full must_have coverage) when decision is "alert" on a feature-led hunt.'),
   },
-  async ({ offer_id, hunt_id, decision, reasoning }) => {
+  async ({ offer_id, hunt_id, decision, reasoning, requirement_checks }) => {
+    const validated = validateRequirementChecks(hunt_id, decision, requirement_checks);
+    if ('error' in validated) return errorResult(validated.error);
+    const checksJson = validated.normalized ? JSON.stringify(validated.normalized) : null;
+
     const recordEval = db.transaction(() => {
       const result = db.prepare(`
-        INSERT INTO evaluations (offer_id, hunt_id, decision, reasoning)
-        VALUES (?, ?, ?, ?)
-      `).run(offer_id, hunt_id, decision, reasoning);
+        INSERT INTO evaluations (offer_id, hunt_id, decision, reasoning, requirement_checks)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(offer_id, hunt_id, decision, reasoning, checksJson);
 
       // Update hunt_offer status
       let hoStatus: string;
@@ -999,9 +1168,28 @@ server.tool(
       db.prepare('UPDATE hunt_offers SET status = ? WHERE hunt_id = ? AND offer_id = ?')
         .run(hoStatus, hunt_id, offer_id);
 
-      // If watch, set offer.watching
+      // If watch, set offer.watching — and surface unverified requirements as a machine-readable
+      // verify_required list in watch_conditions (merged, preserving any price keys already set).
       if (decision === 'watch') {
         db.prepare('UPDATE offers SET watching = 1 WHERE id = ?').run(offer_id);
+        const unverified = (validated.normalized ?? [])
+          .filter((c) => c.verdict === 'unverified')
+          .map((c) => c.requirement);
+        if (unverified.length > 0) {
+          const row = db.prepare('SELECT watch_conditions FROM offers WHERE id = ?').get(offer_id) as
+            | { watch_conditions: string | null }
+            | undefined;
+          let conditions: Record<string, unknown> = {};
+          try {
+            const parsed = row?.watch_conditions ? JSON.parse(row.watch_conditions) : {};
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) conditions = parsed;
+          } catch {
+            // Invalid existing JSON — replace rather than propagate garbage
+          }
+          conditions.verify_required = unverified;
+          db.prepare('UPDATE offers SET watch_conditions = ? WHERE id = ?')
+            .run(JSON.stringify(conditions), offer_id);
+        }
       }
 
       return db.prepare('SELECT * FROM evaluations WHERE id = ?').get(result.lastInsertRowid);
@@ -1259,7 +1447,7 @@ server.tool(
     name: z.string().describe('Short descriptive name for this grouping — also used for offer matching, so include the product name/model'),
     description: z.string().optional().describe('What defines this segment'),
     tags: z.string().optional().describe('JSON array of tags used to match offers to this segment. Include the product model (e.g. "5650G") AND attribute tags (e.g. "ECC-confirmed", "ATX"). For feature-led hunts the exact criteria target key must be included verbatim as one of the tags (e.g. "Kia EV6", not just "EV6") — the activation gate anchors segments to researched targets via tags. Reuse tags from existing segments for consistency — check all_hunt_segments in the response.'),
-    filter_patterns: z.string().optional().describe('JSON object of title patterns, condition filters, price hints for future auto-classification'),
+    filter_patterns: z.string().optional().describe('JSON object gating how the dashboard matches offers to this segment: {"require": [...], "exclude": [...]}. Terms are whole-token, case-insensitive matches against the listing title + subtitle. require: at least one term must appear; exclude: any term present disqualifies. Use when two segments differ only by a token the source omits on the default variant — e.g. AutoTrader labels AWD cars "AWD" but RWD cars carry no drivetrain token, so give the AWD segment {"require": ["AWD"]} and the RWD segment {"exclude": ["AWD"]}. Omit otherwise.'),
     price_low: z.number().optional().describe('DEPRECATED for v2 hunts — price bands are DERIVED from recorded comps. Record comps via record_baseline_price then call recompute_segment_prices. (Legacy v1 hunts: good-deal threshold.)'),
     price_mid: z.number().optional().describe('DEPRECATED for v2 hunts (derived). Legacy v1: typical/fair market price.'),
     price_high: z.number().optional().describe('DEPRECATED for v2 hunts (derived). Legacy v1: overpriced threshold.'),

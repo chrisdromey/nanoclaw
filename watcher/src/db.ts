@@ -167,7 +167,12 @@ function ensureSchema(db: Database.Database): void {
       hunt_id INTEGER NOT NULL REFERENCES hunts(id),
       decision TEXT NOT NULL CHECK(decision IN ('alert', 'skip', 'watch')),
       reasoning TEXT,
-      evaluated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      evaluated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      -- Per-offer requirement verdicts: JSON array of {requirement, verdict, evidence, tier}.
+      -- verdict uses the same enum as claim_verifications ('verified'|'unverified'|'contradicted');
+      -- requirement is a verbatim criteria.intent.must_have / nice_to_have string; tier is 'must'|'nice'.
+      -- NULL = no checks recorded. Declared last so fresh DBs match ALTER TABLE column order.
+      requirement_checks TEXT
     );
 
     CREATE TABLE IF NOT EXISTS alerts (
@@ -230,6 +235,42 @@ function ensureSchema(db: Database.Database): void {
       offers_watched INTEGER NOT NULL DEFAULT 0,
       offers_skipped INTEGER NOT NULL DEFAULT 0,
       logged_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Per-container-result model spend, written by the agent-runner (container side) from the
+    -- SDK result message. Token and cost values are deltas since the previous result in the same
+    -- container process. prompt_head is the first 200 chars of the prompt that produced the turn,
+    -- enough to classify the run (price-change / watch-condition / new-offers / chat).
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT,
+      prompt_head TEXT,
+      models TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      duration_ms INTEGER,
+      num_turns INTEGER,
+      logged_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Jev (TypeSafe) must-have verdicts computed by the watcher at detail-enrichment time
+    -- (handoff #2). Keyed per hunt because must-haves are per hunt. requirement is the verbatim
+    -- criteria.intent.must_have string; verdict enum matches evaluations.requirement_checks.
+    -- probabilities = JSON [{label, p}] of the top candidate evidence lines, for the dashboard.
+    CREATE TABLE IF NOT EXISTS offer_requirement_checks (
+      offer_id INTEGER NOT NULL REFERENCES offers(id),
+      hunt_id INTEGER NOT NULL REFERENCES hunts(id),
+      requirement TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK(verdict IN ('verified', 'unverified', 'contradicted')),
+      evidence TEXT,
+      confidence REAL NOT NULL,
+      probabilities TEXT NOT NULL DEFAULT '[]',
+      model TEXT NOT NULL,
+      checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (offer_id, hunt_id, requirement)
     );
 
     -- Resolved vertical capabilities, mirrored from config/verticals.yml at watcher startup.
@@ -405,6 +446,12 @@ function ensureSchema(db: Database.Database): void {
     db.exec('ALTER TABLE search_queries ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0');
   }
 
+  // evaluations table: per-offer requirement verdicts (see CREATE TABLE comment for shape)
+  const evalCols = db.prepare("PRAGMA table_info('evaluations')").all() as Array<{ name: string }>;
+  if (!evalCols.some((c) => c.name === 'requirement_checks')) {
+    db.exec('ALTER TABLE evaluations ADD COLUMN requirement_checks TEXT');
+  }
+
   // One-time migration: backfill legacy eBay offers that were inserted before vertical column existed.
   // Idempotent — rows that already have a vertical are untouched.
   db.exec("UPDATE offers SET vertical = 'computers' WHERE vertical IS NULL AND source = 'ebay'");
@@ -576,6 +623,50 @@ export function getLatestPrice(
     .get(offerId) as { price: number; shipping: number | null; total_landed_gbp: number | null; observed_at: string } | undefined;
 }
 
+/**
+ * Price the agent last judged: the latest observation at or before the offer's most recent
+ * evaluation. Undefined when the offer has never been evaluated.
+ */
+export function getPriceAtLastEvaluation(db: Database.Database, offerId: number): number | undefined {
+  const row = db
+    .prepare(
+      `SELECT p.price FROM prices p
+       WHERE p.offer_id = ?
+         AND p.observed_at <= (SELECT MAX(evaluated_at) FROM evaluations WHERE offer_id = ?)
+       ORDER BY p.observed_at DESC, p.id DESC LIMIT 1`,
+    )
+    .get(offerId, offerId) as { price: number } | undefined;
+  return row?.price;
+}
+
+export interface OfferRequirementCheckRow {
+  requirement: string;
+  verdict: 'verified' | 'unverified' | 'contradicted';
+  evidence: string | null;
+  confidence: number;
+  probabilities: Array<{ label: string; p: number }>;
+}
+
+export function upsertOfferRequirementChecks(
+  db: Database.Database,
+  offerId: number,
+  huntId: number,
+  model: string,
+  checks: OfferRequirementCheckRow[],
+): void {
+  const stmt = db.prepare(`
+    INSERT OR REPLACE INTO offer_requirement_checks
+      (offer_id, hunt_id, requirement, verdict, evidence, confidence, probabilities, model, checked_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  `);
+  const run = db.transaction(() => {
+    for (const c of checks) {
+      stmt.run(offerId, huntId, c.requirement, c.verdict, c.evidence, c.confidence, JSON.stringify(c.probabilities), model);
+    }
+  });
+  run();
+}
+
 export function getLastSearchTime(
   db: Database.Database,
   huntId: number,
@@ -701,6 +792,40 @@ export function recordSearch(
     )
     .run(huntId, source, terms, resultCount, newOfferCount);
   return result.lastInsertRowid as number;
+}
+
+/**
+ * Length of the run of consecutive zero-result searches ending at the most
+ * recent run for (hunt, source, terms). Inspects at most `limit` recent rows.
+ * Used to surface silently-dead searches: some sources (AutoTrader) return
+ * 0 results — not an error — for an invalid filter value such as a model
+ * name that doesn't exactly match their catalogue ("2" vs "Polestar 2").
+ */
+export function getZeroResultStreak(
+  db: Database.Database,
+  huntId: number,
+  source: string,
+  terms: string,
+  limit = 10,
+): number {
+  const rows = db
+    .prepare(
+      'SELECT result_count FROM search_queries WHERE hunt_id = ? AND source = ? AND terms = ? ORDER BY id DESC LIMIT ?',
+    )
+    .all(huntId, source, terms, limit) as Array<{ result_count: number }>;
+  let streak = 0;
+  for (const row of rows) {
+    if (row.result_count !== 0) break;
+    streak++;
+  }
+  return streak;
+}
+
+/** Append a watcher-generated warning to a hunt's activity log (hunt_log). */
+export function logHuntWarning(db: Database.Database, huntId: number, summary: string): void {
+  db.prepare(
+    "INSERT INTO hunt_log (hunt_id, trigger, summary) VALUES (?, 'watcher_warning', ?)",
+  ).run(huntId, summary);
 }
 
 export function associateOfferWithHunt(

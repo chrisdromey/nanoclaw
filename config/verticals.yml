@@ -5,6 +5,9 @@ _default:
   knowledge_base_path: references/product-knowledge/{product}.md
   sources: []
   default_poll_minutes: 60
+  # criteria_schema {} is permissive — but regardless of vertical, hard requirements belong at
+  # criteria.intent.must_have (string[]): the activation gate and the evaluators' per-offer
+  # requirement_checks all key on those exact strings. See hunt-management SKILL.md.
   criteria_schema: {}
 
 computers:
@@ -38,6 +41,7 @@ cars:
   knowledge_base_path: references/product-knowledge/cars/{make}-{model}.md
   sources: [autotrader]
   default_poll_minutes: 1440  # 24h — car listings change slowly; daily recheck is enough
+  watch_poll_minutes: 1440    # watched car listings too — AT prices move daily at most
   # A cars hunt is a WIDE NET cast across one or more candidate models that share
   # the same budget/location/mileage/fuel. The watcher searches each model with
   # ONLY the filters AutoTrader supports (below); everything judgement-based lives
@@ -61,6 +65,8 @@ cars:
         year_max: integer?
     # intent — EVALUATOR-ONLY. The search NEVER reads this. Put everything AutoTrader
     # cannot filter here: must-have features, trim/pack minimums, reject rules, per-model notes.
+    # must_have is the cross-vertical convention (not cars-specific): gate verification and
+    # per-offer requirement_checks match these entries as exact strings.
     intent:
       must_have: string[]?
       nice_to_have: string[]?

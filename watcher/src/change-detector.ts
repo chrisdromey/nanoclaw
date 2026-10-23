@@ -4,8 +4,8 @@
  */
 
 import type Database from 'better-sqlite3';
-import { AUCTION_THRESHOLDS } from './config.js';
-import { getLatestPrice, type Offer } from './db.js';
+import { AUCTION_THRESHOLDS, PRICE_CHANGE_MIN_PCT, priceChangeMinGbp } from './config.js';
+import { getLatestPrice, getPriceAtLastEvaluation, type Offer } from './db.js';
 import type { ItemDetail } from './sources/ebay/types.js';
 
 export type ChangeType =
@@ -54,22 +54,31 @@ export function detectWatchChanges(
     return changes;
   }
 
-  // Price change
+  // Price change — materiality gate (handoff #1A). Fires only when the price moved since the
+  // last observation AND is materially different from the price the agent last judged (basis).
+  // Measuring against the basis lets a slow drift accumulate instead of being re-suppressed
+  // poll after poll; measuring "moved" against the last observation stops a stable price from
+  // re-firing every poll when the agent never recorded a fresh evaluation.
   const latestPrice = getLatestPrice(db, offer.id);
   const currentPriceStr = item.currentBidPrice?.value || item.price?.value;
-  if (latestPrice && currentPriceStr) {
-    const currentPrice = parseFloat(currentPriceStr);
-    if (Math.abs(currentPrice - latestPrice.price) > 0.01) {
-      const type: ChangeType = currentPrice < latestPrice.price ? 'price_drop' : 'price_increase';
+  const currentPrice = currentPriceStr ? parseFloat(currentPriceStr) : undefined;
+  if (latestPrice && currentPrice != null) {
+    const moved = Math.abs(currentPrice - latestPrice.price) > 0.01;
+    const basis = getPriceAtLastEvaluation(db, offer.id) ?? latestPrice.price;
+    const delta = currentPrice - basis;
+    const material =
+      (basis > 0 && Math.abs(delta) / basis >= PRICE_CHANGE_MIN_PCT / 100) ||
+      Math.abs(delta) >= priceChangeMinGbp(offer.vertical);
+    if (moved && material) {
       changes.push({
-        type,
+        type: delta < 0 ? 'price_drop' : 'price_increase',
         offerId: offer.id,
         source: offer.source,
         sourceId: offer.source_id,
         title: offer.title,
         urgent: false, // may be upgraded by watch condition check below
         details: {
-          previousPrice: latestPrice.price,
+          previousPrice: basis,
           currentPrice,
           currency: item.price?.currency || 'GBP',
         },
@@ -119,15 +128,21 @@ export function detectWatchChanges(
     }
   }
 
-  // Watch condition checks
+  // Watch condition checks — fire on the crossing only: met now and not met at the previous
+  // observation. Without this, an offer sitting below its threshold spawned an evaluator every
+  // poll (600+ watch-condition runs on one hunt).
+  // ponytail: a condition that is already satisfied when the agent sets it never fires; the
+  // agent should have alerted instead of watching, and record_evaluation can lint that later.
   if (offer.watch_conditions) {
     try {
       const conditions = JSON.parse(offer.watch_conditions) as Record<string, unknown>;
-      const priceLandedStr = currentPriceStr;
-      if (priceLandedStr) {
-        const currentPrice = parseFloat(priceLandedStr);
+      if (currentPrice != null) {
+        const newlyMet = (met: (p: number) => boolean): boolean =>
+          met(currentPrice) && (latestPrice == null || !met(latestPrice.price));
+        const below = conditions.alert_if_price_below_gbp;
+        const maxPrice = conditions.max_price;
 
-        if (typeof conditions.alert_if_price_below_gbp === 'number' && currentPrice < conditions.alert_if_price_below_gbp) {
+        if (typeof below === 'number' && newlyMet((p) => p < below)) {
           changes.push({
             type: 'watch_condition_met',
             offerId: offer.id,
@@ -143,7 +158,7 @@ export function detectWatchChanges(
           });
         }
 
-        if (typeof conditions.max_price === 'number' && currentPrice <= conditions.max_price) {
+        if (typeof maxPrice === 'number' && newlyMet((p) => p <= maxPrice)) {
           changes.push({
             type: 'watch_condition_met',
             offerId: offer.id,

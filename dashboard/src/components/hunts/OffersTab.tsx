@@ -14,7 +14,9 @@ import {
 import { cn } from '@/lib/utils';
 import StatusBadge from '@/components/shared/StatusBadge';
 import PipelineBar from '@/components/shared/PipelineBar';
+import RequirementChecks from '@/components/RequirementChecks';
 import type { Hunt, OfferWithPrices, Evaluation } from '@shared/types';
+import { getVerticalUI } from '@/lib/verticals/registry';
 import { useBaseline } from '@/hooks/use-baseline';
 import { assessmentColor, assessmentLabel } from '@/lib/segment-matcher';
 import { RefreshCw } from 'lucide-react';
@@ -44,8 +46,8 @@ interface OffersTableProps {
 }
 
 function OffersTable({ offers, activeTab, hunt, navigate, matchSegment, assessOffer }: OffersTableProps) {
-  const isCars = hunt.vertical === 'cars';
-  const isComputers = !hunt.vertical || hunt.vertical === 'computers';
+  // Per-vertical metadata columns (cars: Year/Mileage; default: Condition/Format).
+  const tableColumns = getVerticalUI(hunt.vertical).offerTableColumns;
   const showAuctionCol =
     (activeTab === 'watching' || activeTab === 'new') &&
     offers.some((o) => o.buying_format?.includes('AUCTION'));
@@ -61,19 +63,11 @@ function OffersTable({ offers, activeTab, hunt, navigate, matchSegment, assessOf
             {activeTab === 'watching' && (
               <th className="text-right py-2.5 px-3 font-medium">Change</th>
             )}
-            {isCars ? (
-              <>
-                <th className="text-left py-2.5 px-3 font-medium">Year</th>
-                <th className="text-left py-2.5 px-3 font-medium">Mileage</th>
-              </>
-            ) : (
-              isComputers && (
-                <th className="text-left py-2.5 px-3 font-medium">Condition</th>
-              )
-            )}
-            {!isCars && (
-              <th className="text-left py-2.5 px-3 font-medium">Format</th>
-            )}
+            {tableColumns?.headers.map((header) => (
+              <th key={header.key} className="text-left py-2.5 px-3 font-medium">
+                {header.label}
+              </th>
+            ))}
             {showAuctionCol && (
               <th className="text-right py-2.5 px-3 font-medium">Ends</th>
             )}
@@ -86,9 +80,8 @@ function OffersTable({ offers, activeTab, hunt, navigate, matchSegment, assessOf
           {offers.map((offer) => {
             const change = priceChange(offer.current_price, offer.first_price);
             const urgency = getCountdownUrgency(offer.auction_end_time);
-            const offerAssessment = assessOffer(offer.current_price, offer.title);
-            const offerSeg = matchSegment(offer.title);
-            const attrs = (offer.attributes as Record<string, unknown>) ?? {};
+            const offerAssessment = assessOffer(offer.current_price, offer);
+            const offerSeg = matchSegment(offer);
             return (
               <tr
                 key={offer.id}
@@ -129,31 +122,7 @@ function OffersTable({ offers, activeTab, hunt, navigate, matchSegment, assessOf
                     {change != null ? formatPercent(change) : '—'}
                   </td>
                 )}
-                {isCars ? (
-                  <>
-                    <td className="py-2.5 px-3 text-zinc-400 text-xs font-mono">
-                      {attrs.year != null ? String(attrs.year) : '—'}
-                    </td>
-                    <td className="py-2.5 px-3 text-zinc-400 text-xs">
-                      {attrs.mileage_text != null ? String(attrs.mileage_text) : '—'}
-                    </td>
-                  </>
-                ) : (
-                  isComputers && (
-                    <td className="py-2.5 px-3 text-zinc-400 text-xs">
-                      {offer.condition || '—'}
-                    </td>
-                  )
-                )}
-                {!isCars && (
-                  <td className="py-2.5 px-3 text-zinc-400 text-xs">
-                    {offer.buying_format?.includes('AUCTION')
-                      ? 'Auc.'
-                      : offer.buying_format?.includes('FIXED')
-                        ? 'BIN'
-                        : offer.buying_format || '—'}
-                  </td>
-                )}
+                {tableColumns?.renderCells(offer)}
                 {showAuctionCol && (
                   <td
                     className={cn(
@@ -309,6 +278,11 @@ export default function OffersTab({ huntId, hunt }: OffersTabProps) {
                 </div>
                 {ev.reasoning && (
                   <p className="text-xs text-zinc-500 mt-1 line-clamp-2">{ev.reasoning}</p>
+                )}
+                {ev.requirement_checks && ev.requirement_checks.length > 0 && (
+                  <div className="mt-1.5">
+                    <RequirementChecks checks={ev.requirement_checks} mode="compact" />
+                  </div>
                 )}
               </div>
             ))}

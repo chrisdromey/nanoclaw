@@ -12,6 +12,7 @@ import {
 import { fitLinearTrend, residual } from '@/lib/regression';
 import {
   matchToSegment,
+  offerMatchText,
   assessPrice,
   assessmentColor,
   assessmentLabel,
@@ -246,7 +247,7 @@ export default function SpecExplorer() {
     }))
     .filter(
       ({ offer, attrs }) =>
-        resolveTargetKeyForOffer(attrs, offer.title, allTargets, allSegments) ===
+        resolveTargetKeyForOffer(attrs, offerMatchText(offer), allTargets, allSegments) ===
         key,
     );
 
@@ -281,7 +282,7 @@ export default function SpecExplorer() {
         fit && attrs.mileage_num != null && offer.current_price != null
           ? residual(offer.current_price, attrs.mileage_num, fit)
           : null;
-      const segMatch = matchToSegment(offer.title, allSegments);
+      const segMatch = matchToSegment(offerMatchText(offer), allSegments);
       const assessment = assessPrice(
         offer.current_price,
         segMatch?.segment ?? null,

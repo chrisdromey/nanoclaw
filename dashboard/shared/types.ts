@@ -78,6 +78,17 @@ export interface HuntOffer {
   first_associated_at: string;
 }
 
+/**
+ * One recorded must-have/nice-to-have verdict from an evaluation. The
+ * `requirement` string is verbatim from the hunt's criteria.intent lists.
+ */
+export interface RequirementCheck {
+  requirement: string;
+  verdict: 'verified' | 'unverified' | 'contradicted';
+  evidence: string;
+  tier?: 'must' | 'nice';
+}
+
 export interface Evaluation {
   id: number;
   offer_id: number;
@@ -85,6 +96,9 @@ export interface Evaluation {
   decision: 'alert' | 'skip' | 'watch';
   reasoning: string | null;
   evaluated_at: string;
+  // JSON column in the DB; parsed to an array by every evaluation-returning
+  // endpoint (null stays null).
+  requirement_checks: RequirementCheck[] | null;
 }
 
 export interface Alert {
@@ -122,13 +136,35 @@ export interface HuntSummary extends Hunt {
   needs_verification?: boolean;
 }
 
-export interface WatchedOffer extends Offer {
+export interface WatchedOffer extends Omit<Offer, 'watch_conditions'> {
   hunt_id: number;
   hunt_name: string;
   pipeline_status: string;
   current_price: number | null;
   first_price: number | null;
   current_shipping: number | null;
+  // Parsed by the /watched endpoint (raw JSON string on the base Offer row).
+  // Price keys (alert_if_price_below_gbp / max_price) plus an optional
+  // verify_required: string[] of unverified must-haves.
+  watch_conditions: Record<string, unknown> | null;
+}
+
+/**
+ * A Jev (TypeSafe System One) must-have verdict computed by the watcher at enrichment time
+ * (offer_requirement_checks). `probabilities` are the top candidate evidence lines with the
+ * probability mass Jev put on each; the label `none` means "no line shows the feature".
+ */
+export interface JevCheck {
+  offer_id: number;
+  hunt_id: number;
+  hunt_name?: string;
+  requirement: string;
+  verdict: 'verified' | 'unverified' | 'contradicted';
+  evidence: string | null;
+  confidence: number;
+  probabilities: Array<{ label: string; p: number }>;
+  model: string;
+  checked_at: string;
 }
 
 export interface OfferDetail extends Offer {
@@ -139,6 +175,7 @@ export interface OfferDetail extends Offer {
   }>;
   evaluations: Array<Evaluation & { hunt_name?: string }>;
   alerts: Array<Alert & { hunt_name?: string }>;
+  jev_checks?: JevCheck[];
 }
 
 export interface OverviewData {

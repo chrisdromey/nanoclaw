@@ -66,6 +66,15 @@ only path, and it is gated — so a half-set-up hunt can never silently run with
    - `criteria.intent` — features, trims, reject rules, per-model notes. The search never sees
      this; the evaluator applies it to the returned listings.
 
+   **`criteria.intent.must_have: string[]` is the canonical home for hard requirements in EVERY
+   vertical** — not just cars. The activation gate (KB coverage, independent verification) and the
+   evaluators' per-offer `requirement_checks` all count verdicts by exact string match against
+   these entries; a hard requirement written anywhere else (a flat `hard_requirements` array, a
+   prose note) is read by NO enforcement and will silently not be checked. **Lint before create:**
+   if the requirements conversation produced any hard requirements, they MUST land in
+   `intent.must_have` — phrased as one testable requirement per entry (these exact strings are
+   what verifiers and evaluators will quote back).
+
    **search_terms must use the exact keys of `criteria.targets`** — the watcher iterates
    search_terms and looks each one up in `targets`, so a mismatch means that model is never
    searched. Set search_terms to the target keys, e.g. keys `"Jaguar I-Pace"`, `"Kia EV6"` →
@@ -90,6 +99,10 @@ only path, and it is gated — so a half-set-up hunt can never silently run with
      (target, must-have). The gate blocks until every pair is `verified`; a `contradicted` verdict
      (e.g. a feature claimed "standard" that's really an optional pack) must be resolved — fix the
      criteria/targets or, only on explicit user instruction, `waive_must_have` with a reason.
+     An `unverified` verdict whose notes start `AMBIGUOUS:` means the must-have wording admits more
+     than one tier of feature — put the verifier's two readings and its proposed rewording to the
+     user as one question, then update `must_have` to the wording they confirm and re-run the
+     verifier for that string. Never pick a reading on their behalf.
    - **Bucket-then-derive the prices** (see `/price-baselining`): segments are defined from the KB
      trims, comps are recorded with source refs + tags, and the band is derived — the gate blocks any
      segment without ≥3 sourced comps or with a too-wide (mixed-trim) spread.

@@ -24,10 +24,14 @@ vi.mock('./sources/index.js', () => ({
 const mockGetTranslator = vi.fn();
 const mockRegisterTranslator = vi.fn();
 
-vi.mock('./translators/index.js', () => ({
-  getTranslator: (...args: unknown[]) => mockGetTranslator(...args),
-  registerTranslator: (...args: unknown[]) => mockRegisterTranslator(...args),
-}));
+vi.mock('./translators/index.js', () => {
+  class TranslatorNotReadyError extends Error {}
+  return {
+    getTranslator: (...args: unknown[]) => mockGetTranslator(...args),
+    registerTranslator: (...args: unknown[]) => mockRegisterTranslator(...args),
+    TranslatorNotReadyError,
+  };
+});
 
 vi.mock('./sources/ebay/auth.js', () => ({
   isAuthError: vi.fn().mockReturnValue(false),
@@ -50,6 +54,12 @@ vi.mock('./config.js', () => ({
   EBAY_CLIENT_ID: 'id',
   EBAY_CLIENT_SECRET: 'secret',
   AUCTION_THRESHOLDS: [24, 12, 6],
+  PRICE_CHANGE_MIN_PCT: 3,
+  priceChangeMinGbp: () => 10,
+  DB_PATH: '/tmp/deal-hunter-test.db',
+  JEV_ENABLED: false,
+  JEV_MODEL: 'jev-test',
+  TYPESAFE_API_KEY: '',
 }));
 
 const mockSendNewOffers = vi.fn();
@@ -140,6 +150,17 @@ function makeTestDb(): Database.Database {
       total_landed_gbp REAL,
       observed_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE hunt_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      hunt_id INTEGER NOT NULL REFERENCES hunts(id),
+      trigger TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      offers_evaluated INTEGER NOT NULL DEFAULT 0,
+      offers_alerted INTEGER NOT NULL DEFAULT 0,
+      offers_watched INTEGER NOT NULL DEFAULT 0,
+      offers_skipped INTEGER NOT NULL DEFAULT 0,
+      logged_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     CREATE TABLE market_segments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       hunt_id INTEGER NOT NULL REFERENCES hunts(id),
@@ -164,7 +185,9 @@ function makeTestDb(): Database.Database {
 function makeState(): SchedulerState {
   return {
     lastSearchTime: new Map(),
-    lastWatchPollTime: 0,
+    lastWatchPollTime: new Map(),
+    // startedAt in the past so per-vertical watch polls are immediately due in tests
+    startedAt: 0,
     lastStalenessSweepTime: 0,
     dailyApiCalls: new Map(),
     dailyApiCallsResetAt: Date.now() + 86_400_000,
@@ -295,6 +318,87 @@ describe('Scheduler dispatch', () => {
     expect(state.consecutiveFailures.get(key)).toBe(3);
   });
 
+  it('retries next tick (no cadence backoff) when the translator module is still loading', async () => {
+    // Daily-cadence hunt: if the startup race were treated as a config error,
+    // the first due search would be deferred a full poll interval.
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical, poll_interval_minutes)
+      VALUES ('Race Hunt', '["Polestar 2"]', 0, '["autotrader"]', 'cars', 1440)
+    `).run();
+
+    const { TranslatorNotReadyError } = await import('./translators/index.js');
+    const translator = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new TranslatorNotReadyError('module not yet loaded');
+      })
+      .mockImplementation((_hunt: unknown, terms: string) => ({ terms }));
+    mockGetTranslator.mockReturnValue(translator);
+
+    const searchMock = vi.fn().mockResolvedValue({ listings: [], apiCalls: 1, errors: [] });
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'autotrader',
+      search: searchMock,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: false, richSearch: false, needsDetailFetch: true },
+      minIntervalMs: 0,
+    });
+
+    const state = makeState();
+    const { tick } = await import('./scheduler.js');
+
+    // Tick 1: translator not ready — search skipped, but NOT backed off.
+    await tick(state, db);
+    expect(searchMock).not.toHaveBeenCalled();
+
+    // Tick 2 (no lastSearchTime.clear() — the point is no backoff was recorded).
+    await tick(state, db);
+    expect(searchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs a hunt_log warning once when an error-free search returns zero results on 3 consecutive polls', async () => {
+    db.prepare(`
+      INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
+      VALUES ('Dead Search Hunt', '["Polestar 2"]', 0, '["autotrader"]', 'cars')
+    `).run();
+    const huntId = (db.prepare('SELECT id FROM hunts').get() as { id: number }).id;
+
+    // AutoTrader returns 0 listings with NO errors for an invalid model value
+    // ("2" instead of "Polestar 2") — a silently-dead search, not a failure.
+    const searchMock = vi.fn().mockResolvedValue({ listings: [], apiCalls: 1, errors: [] });
+    mockHasAdapter.mockReturnValue(true);
+    mockGetAdapter.mockReturnValue({
+      id: 'autotrader',
+      search: searchMock,
+      getState: vi.fn(),
+      capabilities: { hasAuctions: false, richSearch: false, needsDetailFetch: true },
+      minIntervalMs: 0,
+    });
+
+    const state = makeState();
+    const { tick } = await import('./scheduler.js');
+
+    // 4 polls: warning fires when the streak crosses 3, and only once.
+    for (let i = 0; i < 4; i++) {
+      await tick(state, db);
+      state.lastSearchTime.clear();
+    }
+    expect(searchMock).toHaveBeenCalledTimes(4);
+
+    const warnings = db
+      .prepare("SELECT summary FROM hunt_log WHERE hunt_id = ? AND trigger = 'watcher_warning'")
+      .all(huntId) as Array<{ summary: string }>;
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].summary).toContain('"Polestar 2" on autotrader');
+    expect(warnings[0].summary).toContain('0 results');
+
+    // No auto-pause and no failure accounting: zero results is not an error.
+    // (clearSourceFailures keeps a zeroed entry for the key.)
+    for (const count of state.consecutiveFailures.values()) expect(count).toBe(0);
+    expect(state.sourcePausedAt.size).toBe(0);
+  });
+
   it('auto-pauses source after 10 consecutive failures', async () => {
     db.prepare(`
       INSERT INTO hunts (name, search_terms, cadence_minutes, sources, vertical)
@@ -399,8 +503,8 @@ describe('Scheduler dispatch', () => {
     // The network adapter is never reached, and no failure budget is burned.
     expect(searchMock).not.toHaveBeenCalled();
     expect(state.consecutiveFailures.get(`${huntId}:ebay:broken`) ?? 0).toBe(0);
-    // It backs off to cadence (lastSearchTime set) instead of spamming every tick.
-    expect(state.lastSearchTime.has(`${huntId}:ebay:broken`)).toBe(true);
+    // It backs off to cadence (batch stamp set) instead of spamming every tick.
+    expect(state.lastSearchTime.has(`${huntId}:ebay`)).toBe(true);
   });
 
   it('auto-pause is recoverable: probes again after the cool-down without a restart', async () => {
@@ -618,7 +722,7 @@ describe('Scheduler dispatch', () => {
     const state = makeState();
     // Searched 1 hour ago — below the 360-min cars default, so it must be skipped
     // (would NOT be skipped under the old cadence_minutes=60 behaviour).
-    state.lastSearchTime.set(`${huntId}:autotrader:audi a4`, Date.now() - 60 * 60_000);
+    state.lastSearchTime.set(`${huntId}:autotrader`, Date.now() - 60 * 60_000);
 
     const { tick } = await import('./scheduler.js');
     await tick(state, db);
@@ -646,7 +750,7 @@ describe('Scheduler dispatch', () => {
 
     const state = makeState();
     // Override = 1 min; searched 5 min ago => eligible (despite cars 360-min default).
-    state.lastSearchTime.set(`${huntId}:autotrader:bmw`, Date.now() - 5 * 60_000);
+    state.lastSearchTime.set(`${huntId}:autotrader`, Date.now() - 5 * 60_000);
 
     const { tick } = await import('./scheduler.js');
     await tick(state, db);

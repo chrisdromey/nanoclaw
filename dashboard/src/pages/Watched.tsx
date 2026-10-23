@@ -17,10 +17,64 @@ import { useState, useEffect } from 'react';
 import { useFlash } from '@/hooks/use-flash';
 import {
   matchToSegment,
+  offerMatchText,
   assessPrice,
   assessmentColor,
   assessmentLabel,
 } from '@/lib/segment-matcher';
+
+/**
+ * Compact chip row for an offer's parsed watch_conditions: price keys render
+ * as neutral chips ("alert < £12,000", "max £15,000"), verify_required
+ * entries (unverified must-haves) as warning chips ("verify: …").
+ */
+function WatchConditionChips({
+  conditions,
+}: {
+  conditions: Record<string, unknown> | null;
+}) {
+  if (!conditions) return null;
+
+  const chips: Array<{ key: string; label: string; warning?: boolean }> = [];
+  if (typeof conditions.alert_if_price_below_gbp === 'number') {
+    chips.push({
+      key: 'alert_below',
+      label: `alert < ${formatPrice(conditions.alert_if_price_below_gbp)}`,
+    });
+  }
+  if (typeof conditions.max_price === 'number') {
+    chips.push({
+      key: 'max_price',
+      label: `max ${formatPrice(conditions.max_price)}`,
+    });
+  }
+  if (Array.isArray(conditions.verify_required)) {
+    for (const item of conditions.verify_required) {
+      if (typeof item === 'string') {
+        chips.push({ key: `verify-${item}`, label: `verify: ${item}`, warning: true });
+      }
+    }
+  }
+  if (chips.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap gap-1 mt-1">
+      {chips.map((chip) => (
+        <span
+          key={chip.key}
+          className={cn(
+            'inline-flex items-center px-1.5 py-0.5 rounded text-tiny',
+            chip.warning
+              ? 'bg-warning-muted text-warning'
+              : 'bg-raised border border-zinc-700 text-zinc-400',
+          )}
+        >
+          {chip.label}
+        </span>
+      ))}
+    </div>
+  );
+}
 
 export default function Watched() {
   const navigate = useNavigate();
@@ -68,7 +122,7 @@ export default function Watched() {
   const getSegmentInfo = (offer: WatchedOffer) => {
     const baseline = baselines?.get(offer.hunt_id);
     if (!baseline?.segments.length) return null;
-    const match = matchToSegment(offer.title, baseline.segments);
+    const match = matchToSegment(offerMatchText(offer), baseline.segments);
     if (!match) return null;
     const assessment = assessPrice(offer.current_price, match.segment);
     return { ...match, assessment };
@@ -146,8 +200,9 @@ export default function Watched() {
                         <div className="w-2 h-2 rounded-full bg-warning mx-auto" />
                       )}
                     </td>
-                    <td className="py-2.5 px-3 text-zinc-300 max-w-xs truncate">
-                      {offer.title}
+                    <td className="py-2.5 px-3 text-zinc-300 max-w-xs">
+                      <div className="truncate">{offer.title}</div>
+                      <WatchConditionChips conditions={offer.watch_conditions} />
                     </td>
                     {/* Segment */}
                     <td className="py-2.5 px-3 text-xs text-zinc-500 max-w-[120px] truncate">

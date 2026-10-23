@@ -339,14 +339,25 @@ function getGateVersion(db: Database.Database, huntId: number): number {
 // A hunt is "feature-led" when its criteria carry non-empty intent.must_have — it is bought by
 // feature, so it needs a spec KB (C) and must-have verification (D). Per-hunt (not per-vertical), so
 // computers (empty criteria_schema, no must_have) naturally skips C/D while any future vertical that
-// adds must_have is covered automatically.
-function huntMustHaves(criteria: unknown): string[] {
+// adds must_have is covered automatically. Exported so record_evaluation can validate per-offer
+// requirement_checks against the same strings the gate anchors on.
+export function huntMustHaves(criteria: unknown): string[] {
+  return intentStringList(criteria, 'must_have');
+}
+
+// Same shape-handling for intent.nice_to_have — per-offer requirement_checks may also cover these
+// (recorded with tier 'nice'; never enforced).
+export function huntNiceToHaves(criteria: unknown): string[] {
+  return intentStringList(criteria, 'nice_to_have');
+}
+
+function intentStringList(criteria: unknown, field: string): string[] {
   if (!criteria || typeof criteria !== 'object') return [];
   const intent = (criteria as Record<string, unknown>).intent;
   if (!intent || typeof intent !== 'object') return [];
-  const mh = (intent as Record<string, unknown>).must_have;
-  if (!Array.isArray(mh)) return [];
-  return mh.filter((s): s is string => typeof s === 'string' && s.trim() !== '');
+  const list = (intent as Record<string, unknown>)[field];
+  if (!Array.isArray(list)) return [];
+  return list.filter((s): s is string => typeof s === 'string' && s.trim() !== '');
 }
 
 // Candidate target keys for a feature-led hunt: the keys of every `<...>` wildcard map the schema

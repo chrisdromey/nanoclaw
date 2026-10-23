@@ -28,6 +28,8 @@ export interface VerticalConfig {
   knowledge_base_path: string;
   sources: string[];
   default_poll_minutes: number;
+  /** Cadence for re-checking WATCHED offers of this vertical (minutes). Absent → watcher default (2h). */
+  watch_poll_minutes?: number;
   criteria_schema: Record<string, unknown>;
   notification_formatter?: string;
   attributes_required?: string[];
@@ -42,6 +44,7 @@ type RawBlock = {
   knowledge_base_path?: string;
   sources?: string[];
   default_poll_minutes?: number;
+  watch_poll_minutes?: number;
   criteria_schema?: Record<string, unknown>;
   notification_formatter?: string;
   attributes_required?: string[];
@@ -127,6 +130,7 @@ export function loadVerticals(path?: string): Map<string, VerticalConfig> {
         'references/product-knowledge/{product}.md',
       sources: resolved.sources ?? [],
       default_poll_minutes: resolved.default_poll_minutes ?? 60,
+      watch_poll_minutes: resolved.watch_poll_minutes,
       criteria_schema: resolved.criteria_schema ?? {},
       notification_formatter: resolved.notification_formatter,
       attributes_required: resolved.attributes_required,

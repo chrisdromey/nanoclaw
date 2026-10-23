@@ -29,11 +29,17 @@ function readEnvFile(keys: string[]): Record<string, string> {
   return result;
 }
 
-const env = readEnvFile(['EBAY_CLIENT_ID', 'EBAY_CLIENT_SECRET']);
+const env = readEnvFile(['EBAY_CLIENT_ID', 'EBAY_CLIENT_SECRET', 'TYPESAFE_API_KEY', 'JEV_MODEL', 'JEV_ENABLED']);
 
 export const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID || env.EBAY_CLIENT_ID || '';
 export const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET || env.EBAY_CLIENT_SECRET || '';
 export const EBAY_MARKETPLACE = 'EBAY_GB';
+
+// TypeSafe Jev (System One) — see docs/delhunter/jev-integration-handoff.md.
+// Pinned to a versioned model so tuned thresholds don't drift when `jev-latest` moves.
+export const TYPESAFE_API_KEY = process.env.TYPESAFE_API_KEY || env.TYPESAFE_API_KEY || '';
+export const JEV_MODEL = process.env.JEV_MODEL || env.JEV_MODEL || 'jev-1.13.0';
+export const JEV_ENABLED = (process.env.JEV_ENABLED ?? env.JEV_ENABLED ?? '1') !== '0' && TYPESAFE_API_KEY !== '';
 
 export const DB_PATH = path.join(PROJECT_ROOT, 'groups/telegram_main/deal-hunter.db');
 export const IPC_DIR = path.join(PROJECT_ROOT, 'data/ipc/telegram_main');
@@ -53,6 +59,16 @@ export const STALENESS_SWEEP_CADENCE_MS = 4 * 60 * 60_000; // Sweep stale offers
 export const STALE_OFFER_HOURS = 24;              // Offers unseen for 24h are considered stale
 export const DAILY_API_BUDGET = 4500;             // Stop at 4500 (limit is 5000/day)
 export const SEARCH_LIMIT_PER_FORMAT = 50;
+
+// Price-change materiality gate (handoff #1A). A watched offer's price move only triggers a
+// re-evaluation when it is at least this % OR this many £ away from the price the agent last
+// judged. Smaller moves are still recorded in `prices`, just not announced.
+export const PRICE_CHANGE_MIN_PCT = Math.max(0, intFromEnv('PRICE_CHANGE_MIN_PCT', 3));
+const PRICE_CHANGE_MIN_GBP_DEFAULTS: Record<string, number> = { cars: 250, computers: 10 };
+export function priceChangeMinGbp(vertical: string | null): number {
+  const v = vertical ?? '';
+  return Math.max(0, intFromEnv(`PRICE_CHANGE_MIN_GBP_${v.toUpperCase()}`, PRICE_CHANGE_MIN_GBP_DEFAULTS[v] ?? 10));
+}
 
 // New-offer triage queue management (token-burn protection).
 // All values are clamped to sane minimums — a zero/negative env override would otherwise

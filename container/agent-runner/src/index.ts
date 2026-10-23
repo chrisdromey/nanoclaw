@@ -17,11 +17,56 @@
 import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import { buildEvaluatorAgents } from './vertical-agents.js';
+import {
+  AUTOTRADER_SEARCH_TOOLS,
+  DEAL_HUNTER_DB_TOOLS,
+  EBAY_API_TOOLS,
+  EBAY_SEARCH_TOOLS,
+  SOLD_DATA_TOOLS,
+  mcpToolNames,
+} from './mcp-tool-names.js';
 import { createManageHuntGateHook, createDraftGuardStopHook, createTriageDelegationGateHook } from './deal-hunter-hooks.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Deal Hunter spend accounting: one row per SDK result message, written straight into the
+// group's deal-hunter.db (present only for the deal-hunter group; silently skipped elsewhere).
+// The watcher's ensureSchema() owns the agent_runs table.
+const DEAL_HUNTER_DB = '/workspace/group/deal-hunter.db';
+interface AgentRunRow {
+  session_id: string | undefined;
+  prompt_head: string;
+  models: string;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  duration_ms: number | undefined;
+  num_turns: number | undefined;
+}
+function recordAgentRun(row: AgentRunRow): void {
+  if (!fs.existsSync(DEAL_HUNTER_DB)) return;
+  try {
+    const db = new Database(DEAL_HUNTER_DB);
+    try {
+      db.pragma('busy_timeout = 5000');
+      db.prepare(`INSERT INTO agent_runs
+        (session_id, prompt_head, models, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_usd, duration_ms, num_turns)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        row.session_id ?? null, row.prompt_head, row.models, row.input_tokens, row.cache_read_tokens,
+        row.cache_write_tokens, row.output_tokens, row.cost_usd, row.duration_ms ?? null, row.num_turns ?? null,
+      );
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    log(`agent_runs insert failed (non-fatal): ${err}`);
+  }
+}
 
 interface ContainerInput {
   prompt: string;
@@ -372,6 +417,9 @@ async function runQuery(
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
   stream.push(prompt);
+  let lastPromptHead = prompt.slice(0, 200);
+  // Cumulative totals seen on the previous result message; agent_runs stores per-result deltas.
+  const prevTotals = { cost: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -388,6 +436,7 @@ async function runQuery(
     const messages = drainIpcInput();
     for (const text of messages) {
       log(`Piping IPC message into active query (${text.length} chars)`);
+      lastPromptHead = text.slice(0, 200);
       stream.push(text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
@@ -493,7 +542,7 @@ If something fails, say so — don't retry silently. Say what went wrong and wha
         // - deal-hunter-db: explicit subset, NOT the wildcard. Batch-triage tools
         //   (get_hunt_summary, list_offers, record_evaluation, batch_dismiss, update_offer)
         //   are deliberately absent: offer evaluation must run inside evaluator sub-agents
-        //   (which grant mcp__deal-hunter-db__* themselves), never in this long-lived main
+        //   (which grant the full deal-hunter-db tool set themselves), never in this long-lived main
         //   context — inline triage was the biggest token sink in the Jun 2026 burn incident.
         //   Single-item deep dives (get_offer, get_offer_history) stay available here for
         //   interactive chat; they're bounded, unlike batch scans.
@@ -599,15 +648,18 @@ Key rules:
 - Do NOT activate a feature-led hunt yourself before its must-have features have been independently verified — that is the musthave-verifier's job (the gate will block otherwise)
 - Write prose findings to the hunt file (and knowledge-base files) as the skills instruct`,
           tools: [
-            'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+            // No Bash: all DB writes go through the deal-hunter-db MCP tools (raw-sqlite bypass
+            // is closed for every deal-hunter sub-agent); files are covered by Read/Write/Edit.
+            // Exact MCP tool names only — AgentDefinition.tools silently drops globs.
+            'Read', 'Write', 'Edit', 'Glob', 'Grep',
             'WebSearch', 'WebFetch',
             'TodoWrite',
-            'mcp__deal-hunter-db__*',
-            'mcp__sold-data__*',
+            ...mcpToolNames('deal-hunter-db', DEAL_HUNTER_DB_TOOLS),
+            ...mcpToolNames('sold-data', SOLD_DATA_TOOLS),
             // Cross-vertical researcher: needs every source's search tools for baselining.
-            'mcp__autotrader-search__*',
-            ...(ebayAccessToken ? ['mcp__ebay-search__*'] : []),
-            ...(process.env.EBAY_CLIENT_ID ? ['mcp__ebay-api__*'] : []),
+            ...mcpToolNames('autotrader-search', AUTOTRADER_SEARCH_TOOLS),
+            ...(ebayAccessToken ? mcpToolNames('ebay-search', EBAY_SEARCH_TOOLS) : []),
+            ...(process.env.EBAY_CLIENT_ID ? mcpToolNames('ebay-api', EBAY_API_TOOLS) : []),
           ],
           model: 'sonnet',
           skills: ['price-baselining', 'ebay-sourcing', 'cars-sourcing', 'car-spec-research'],
@@ -635,10 +687,10 @@ Key rules:
 - Prefer 'unverified' over a guess when sources are silent or conflicting; never invent a verdict
 - Return a concise summary (under 500 words): per target, which must-haves verified / unverified / contradicted, with the key evidence`,
           tools: [
-            'Bash', 'Read', 'Glob', 'Grep',
+            'Read', 'Glob', 'Grep',
             'WebSearch', 'WebFetch',
             'TodoWrite',
-            'mcp__deal-hunter-db__*',
+            ...mcpToolNames('deal-hunter-db', DEAL_HUNTER_DB_TOOLS),
           ],
           model: 'sonnet',
           skills: ['musthave-verification'],
@@ -655,10 +707,10 @@ Key rules:
 - Record all evaluations to the database before returning
 - Keep notification format source-agnostic (no eBay-specific language)`,
           tools: [
-            'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
+            'Read', 'Write', 'Edit', 'Glob', 'Grep',
             'TodoWrite',
-            'mcp__deal-hunter-db__*',
-            'mcp__sold-data__*',
+            ...mcpToolNames('deal-hunter-db', DEAL_HUNTER_DB_TOOLS),
+            ...mcpToolNames('sold-data', SOLD_DATA_TOOLS),
           ],
           // Haiku: this evaluator is threshold-based (offer price vs sold-comp baseline /
           // price tier → ALERT/WATCH/SKIP) and serves low-value T1/T2 verticals. The nuanced
@@ -726,6 +778,35 @@ Key rules:
         log(`Auto-compact: ${cumulativeInputTokens} input tokens exceed threshold of ${COMPACT_THRESHOLD_TOKENS}`);
         compactRequested = true;
         stream.push('/compact');
+      }
+
+      // Spend accounting (Deal Hunter only). modelUsage and total_cost_usd are cumulative for the
+      // process, so store the delta since the previous result.
+      {
+        const r = message as {
+          total_cost_usd?: number; duration_ms?: number; num_turns?: number; session_id?: string;
+          modelUsage?: Record<string, { inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }>;
+        };
+        const totals = { cost: r.total_cost_usd ?? 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+        for (const u of Object.values(r.modelUsage ?? {})) {
+          totals.input += u.inputTokens ?? 0;
+          totals.cacheRead += u.cacheReadInputTokens ?? 0;
+          totals.cacheWrite += u.cacheCreationInputTokens ?? 0;
+          totals.output += u.outputTokens ?? 0;
+        }
+        recordAgentRun({
+          session_id: r.session_id ?? newSessionId,
+          prompt_head: lastPromptHead,
+          models: Object.keys(r.modelUsage ?? {}).join(','),
+          input_tokens: totals.input - prevTotals.input,
+          cache_read_tokens: totals.cacheRead - prevTotals.cacheRead,
+          cache_write_tokens: totals.cacheWrite - prevTotals.cacheWrite,
+          output_tokens: totals.output - prevTotals.output,
+          cost_usd: totals.cost - prevTotals.cost,
+          duration_ms: r.duration_ms,
+          num_turns: r.num_turns,
+        });
+        Object.assign(prevTotals, totals);
       }
 
       const textResult = 'result' in message ? (message as { result?: string }).result : null;

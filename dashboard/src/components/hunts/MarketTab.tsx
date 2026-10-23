@@ -5,7 +5,7 @@ import { apiGet } from '@/lib/api';
 import { queryKeys } from '@/lib/query-keys';
 import { formatPrice, formatRelativeTime, formatCountdown, getCountdownUrgency } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { matchToSegment, assessPrice, assessmentColor } from '@/lib/segment-matcher';
+import { matchToSegment, offerMatchText, assessPrice, assessmentColor } from '@/lib/segment-matcher';
 import StatusBadge from '@/components/shared/StatusBadge';
 import PriceTierBar, { priceToPct } from '@/components/shared/PriceTierBar';
 import {
@@ -160,7 +160,7 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
 
     for (const offer of parsedOffers) {
       if (offer.current_price == null) continue;
-      const match = matchToSegment(offer.title, baseline.segments);
+      const match = matchToSegment(offerMatchText(offer), baseline.segments);
       if (match) {
         const list = map.get(match.segment.id) || [];
         list.push(offer);
@@ -229,7 +229,7 @@ export default function MarketTab({ huntId, budget, vertical }: MarketTabProps) 
 
     for (const offer of parsedOffers) {
       if (offer.current_price == null) continue;
-      const match = matchToSegment(offer.title, baseline.segments);
+      const match = matchToSegment(offerMatchText(offer), baseline.segments);
       if (match) {
         const assessment = assessPrice(offer.current_price, match.segment);
         if (assessment === 'good') goodDeals++;
@@ -500,7 +500,7 @@ function MarketOverview({
     return activeOffers
       .filter((o) => o.current_price != null)
       .map((o) => {
-        const match = matchToSegment(o.title, segments);
+        const match = matchToSegment(offerMatchText(o), segments);
         const assessment = match ? assessPrice(o.current_price, match.segment) : null;
         const auction = showAuctionUrgency && isAuction(o);
         return { ...o, assessment, auction, left: pct(o.current_price!) };

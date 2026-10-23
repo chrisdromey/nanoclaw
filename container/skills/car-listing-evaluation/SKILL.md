@@ -107,10 +107,11 @@ For each must-have feature:
 
 1. Search the car's `features` (and the `description`/`specs`) for it. Feature names vary by manufacturer — **match on meaning, not exact string**: e.g. "adaptive cruise" ≈ "Adaptive Cruise Control" ≈ "ProPilot" ≈ "Smart Cruise Control"; "lane assist" ≈ "Lane Departure Warning"/"Lane Keep Assist". The model KB's "verify on a listing" notes tell you what each model calls it.
 2. Resolve a verdict:
-   - **Present** (listed as Standard, or Optional-and-listed) → satisfied.
-   - **Absent from the equipment list** → AutoTrader lists fitted optional extras, so absence is meaningful. On a car where the KB says this feature is at best optional, treat absence as NOT fitted. SKIP if it's a hard must-have (unless the user has relaxed it).
-   - **Can't tell** (no features data even after `autotrader_detail`, or genuinely ambiguous) → do not assume. WATCH with a note to confirm, or ALERT with an explicit caveat (e.g. "ACC not shown in AT's feature list — confirm with the seller").
+   - **Present** (listed as Standard, or Optional-and-listed) → satisfied → record verdict `verified`.
+   - **Absent from the equipment list** → AutoTrader lists fitted optional extras, so absence is meaningful. On a car where the KB says this feature is at best optional, treat absence as NOT fitted → record verdict `contradicted`. SKIP if it's a hard must-have (unless the user has relaxed it).
+   - **Can't tell** (no features data even after `autotrader_detail`, or genuinely ambiguous) → do not assume → record verdict `unverified`. WATCH with a note to confirm, or ALERT with an explicit caveat (e.g. "ACC not shown in AT's feature list — confirm with the seller").
 3. Cross-check against the trim: map the derivative string (title/subTitle, e.g. "2.0 TDI S Line") to the KB trim ladder. If the equipment list contradicts the expected trim, trust the equipment list (individual cars carry factory options above their trim) but note the discrepancy.
+4. **Record the verdicts** as `requirement_checks` on the `record_evaluation` call in Step 4 — one entry per must-have: `{requirement, verdict, evidence}`. Quote the `must_have` strings **verbatim** (same exact-string rule as `record_claim_verification` — a paraphrase satisfies nothing), and put the specific equipment-list entry (or its meaningful absence) in `evidence`. Checks against `nice_to_have` entries are welcome too — they're recorded but never enforced.
 
 Honest uncertainty beats a confident guess — flagging "couldn't confirm" IS the value. If the model has no KB, say so and recommend `/car-spec-research`; don't improvise trim/feature facts from memory.
 
@@ -139,14 +140,15 @@ For each offer:
 - **WATCH** — promising but needs monitoring: e.g. GOOD tier, right spec, might drop; or NOANALYSIS but price seems right
 - **SKIP** — overpriced, wrong spec, too far, high mileage for price
 
-Record: `mcp__deal-hunter-db__record_evaluation` for every decision.
+Record: `mcp__deal-hunter-db__record_evaluation` for every decision, passing the Step 2b verdicts as `requirement_checks`. On a feature-led hunt, **ALERT requires a check for every `must_have` entry** and is refused if any is `contradicted` — a failed hard requirement is a skip, not an alert. `unverified` is allowed on an alert, but the caveat must appear in the alert message.
 
 For ALERT: also call `mcp__deal-hunter-db__record_alert`.
 
-For WATCH: call `mcp__deal-hunter-db__update_offer` with `watching: true` and `watch_conditions`, e.g.:
+For WATCH: call `mcp__deal-hunter-db__update_offer` with `watching: true` and `watch_conditions`. Canonical keys (anything else is ignored by the watcher): `alert_if_price_below_gbp` (number), `max_price` (number). E.g.:
 ```json
 {"alert_if_price_below_gbp": 12000}
 ```
+`verify_required` (the unverified must-haves) is auto-populated on the offer by `record_evaluation` when you watch with unverified checks — don't hand-write it, and don't stash free-text notes in `watch_conditions` (notes belong in `reasoning`).
 
 ## Notification format
 

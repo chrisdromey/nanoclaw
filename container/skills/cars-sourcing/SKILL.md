@@ -66,6 +66,13 @@ Hand these per-trim segments (name like "{Model} {Trim}", e.g. "Leaf N-Connecta"
 including model + trim tokens, e.g. `["leaf","n-connecta"]`; the price spread; and a
 confidence reflecting how many comps you found) to `/price-baselining`, which records them.
 
+Watch for segment pairs that differ only by a token AutoTrader omits on the default
+variant — drivetrain is the common case: AWD cars say "AWD" in the subtitle but RWD/FWD
+cars usually carry no drivetrain token at all, so tags alone can't separate "GT-Line RWD"
+from "GT-Line AWD" on an RWD listing. When you create such a pair, set the
+`filter_patterns` argument of `create_market_segment` (require the token on the labelled
+segment, exclude it on the default one — the tool description has the exact shape).
+
 ## Interpreting AutoTrader pricing
 
 - AutoTrader prices are **asking** prices, not sold. Record baseline comps with

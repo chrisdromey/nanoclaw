@@ -24,7 +24,7 @@ import {
 } from './config.js';
 import { getAdapter, hasAdapter } from './sources/index.js';
 import { isAuthError, invalidateToken } from './sources/ebay/auth.js';
-import { getTranslator } from './translators/index.js';
+import { getTranslator, TranslatorNotReadyError } from './translators/index.js';
 import { getVertical } from './verticals.js';
 import {
   getActiveHunts,
@@ -37,6 +37,8 @@ import {
   getHuntIdsForOffer,
   getSegmentCount,
   applyNormalisedResults,
+  getZeroResultStreak,
+  logHuntWarning,
   mergeOfferAttributes,
   updateOfferStatus,
   updateOfferWatchFields,
@@ -46,7 +48,8 @@ import {
 } from './db.js';
 import { detectWatchChanges } from './change-detector.js';
 import { sendUrgentNotification, sendNewOffersNotification, sendPriceChangeNotification } from './notifier.js';
-import { getNotifiedThresholds, addNotifiedThreshold } from './db.js';
+import { getNotifiedThresholds, addNotifiedThreshold, getOfferBySourceId } from './db.js';
+import { shadowMustHaveChecks } from './jev/shadow.js';
 
 // --- Per-source daily API budget ---
 
@@ -63,8 +66,22 @@ function getSourceBudget(sourceId: string): number {
 }
 
 export interface SchedulerState {
+  /**
+   * Last completed search batch per hunt+source. Format: `${huntId}:${sourceId}` → epoch ms.
+   * Cadence is deliberately gated at hunt+source level (NOT per term): all of a hunt's terms
+   * search together in one batch, so one daily poll yields ONE triage notification (one
+   * evaluator agent run) instead of per-term phase drift splitting it into several.
+   */
   lastSearchTime: Map<string, number>;
-  lastWatchPollTime: number;
+  /**
+   * Last watch poll per vertical (key: offers.vertical, '' for null). Cadence comes from the
+   * vertical's watch_poll_minutes (verticals.yml), default WATCH_CADENCE_MS. Missing key →
+   * treated as `startedAt` so the first poll after a restart is deferred one full cadence
+   * (avoids stale-token errors on restart, same intent as the old scalar field).
+   */
+  lastWatchPollTime: Map<string, number>;
+  /** Scheduler start time — the defer anchor for per-vertical watch polls. */
+  startedAt: number;
   lastStalenessSweepTime: number;
   /** Per-source daily API call counts, keyed by source id. */
   dailyApiCalls: Map<string, number>;
@@ -122,7 +139,8 @@ function addSourceCalls(state: SchedulerState, sourceId: string, n: number): voi
 export function initState(db: Database.Database): SchedulerState {
   const state: SchedulerState = {
     lastSearchTime: new Map(),
-    lastWatchPollTime: Date.now(),  // defer first watch poll to avoid stale-token errors on restart
+    lastWatchPollTime: new Map(),  // empty → per-vertical polls defer to startedAt (see field docs)
+    startedAt: Date.now(),
     lastStalenessSweepTime: Date.now(),  // defer first sweep similarly
     dailyApiCalls: new Map(),
     dailyApiCallsResetAt: nextMidnight(),
@@ -137,12 +155,16 @@ export function initState(db: Database.Database): SchedulerState {
   for (const hunt of hunts) {
     const entries = parseSearchTerms(hunt.search_terms);
     for (const sourceId of hunt.sources) {
+      // Seed the hunt+source cadence key with the MOST RECENT term search: a batch that was
+      // split by pre-batching phase drift shouldn't re-run wholesale on restart; drifted terms
+      // realign to the batch on its next due poll instead.
+      let latest = 0;
       for (const entry of entries) {
         const last = getLastSearchTime(db, hunt.id, sourceId, entry.terms);
-        if (last) {
-          // Key now includes source to avoid cadence collisions across sources
-          state.lastSearchTime.set(`${hunt.id}:${sourceId}:${entry.terms}`, new Date(last).getTime());
-        }
+        if (last) latest = Math.max(latest, new Date(last).getTime());
+      }
+      if (latest > 0) {
+        state.lastSearchTime.set(`${hunt.id}:${sourceId}`, latest);
       }
     }
   }
@@ -152,6 +174,14 @@ export function initState(db: Database.Database): SchedulerState {
 }
 
 const CONSECUTIVE_FAILURE_PAUSE_THRESHOLD = 10;
+
+/**
+ * Error-free searches returning 0 listings this many polls running trigger a
+ * one-off hunt_log warning (see the silently-dead search guard in the search
+ * loop). Fires only when the streak equals the threshold exactly, so a
+ * legitimately scarce search (streak grows past it) isn't re-warned every poll.
+ */
+const ZERO_RESULT_WARN_STREAK = 3;
 
 /**
  * Cool-down before an auto-paused (hunt, source, terms) is probed again.
@@ -320,12 +350,36 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
       }
       const adapter = getAdapter(sourceId);
 
+      // Cadence is gated per hunt+source, NOT per term: all of a hunt's terms search together
+      // in one batch, so a daily poll produces ONE triage notification (one evaluator agent
+      // run). Per-term gating let term phases drift apart (a failed/late term re-runs on its
+      // own schedule), splitting the day's batch into several notifications — each spawning
+      // its own agent run with full fixed context overhead.
+      const cadenceKey = `${hunt.id}:${sourceId}`;
+      const lastRun = state.lastSearchTime.get(cadenceKey) ?? 0;
+      if (Date.now() - lastRun < cadenceMs) continue;
+
+      // Translator is per (vertical, source) — resolve once for the batch. A missing translator
+      // is a deterministic config error: retrying won't make it appear. Back off to the hunt's
+      // cadence so it's logged once per poll, not every 30s tick — and it self-heals the moment
+      // one is registered.
+      const translator = getTranslator(hunt.vertical, sourceId);
+      if (!translator) {
+        logger.warn(
+          { huntId: hunt.id, vertical: hunt.vertical, sourceId },
+          'No translator registered for vertical/source pair — skipping',
+        );
+        state.lastSearchTime.set(cadenceKey, Date.now());
+        continue;
+      }
+
+      // Startup race guard: if the translator's lazily-imported module isn't loaded yet, we
+      // abort the batch WITHOUT stamping the cadence key — stamping would cost a daily-cadence
+      // hunt its first due batch after every restart. The next 30s tick retries the batch.
+      let translatorNotReady = false;
+
       for (const entry of searchTermEntries) {
         const terms = entry.terms;
-        const key = `${hunt.id}:${sourceId}:${terms}`;
-        const lastRun = state.lastSearchTime.get(key) ?? 0;
-
-        if (Date.now() - lastRun < cadenceMs) continue;
 
         // Skip if auto-paused
         if (isSourcePaused(state, hunt.id, sourceId, terms)) {
@@ -334,36 +388,28 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
         }
 
         // --- Translate criteria → native params (deterministic / config step) ---
-        // Kept in its own try/catch, separate from the network search below: a
-        // translator throw is a config/criteria error (e.g. missing make/postcode)
-        // that will throw identically on every retry. Counting it toward the
-        // transient auto-pause budget just silently disables the source after 10
-        // pointless retries. Instead we surface it distinctly and back off to the
-        // hunt's normal cadence (set lastSearchTime) so it's logged once per poll,
-        // not every tick — and it self-heals the moment the criteria is fixed.
-        const translator = getTranslator(hunt.vertical, sourceId);
-        if (!translator) {
-          logger.warn(
-            { huntId: hunt.id, vertical: hunt.vertical, sourceId },
-            'No translator registered for vertical/source pair — skipping',
-          );
-          // Deterministic config error (same class as a translator throw): a missing
-          // translator won't appear by retrying. Back off to the hunt's cadence so we
-          // log it once per poll, not every 30s tick, and self-heal once one is registered.
-          state.lastSearchTime.set(key, Date.now());
-          continue;
-        }
-
+        // Kept in its own try/catch, separate from the network search below: a translator throw
+        // is a per-term criteria error (e.g. missing make/postcode) that will throw identically
+        // on every retry. Counting it toward the transient auto-pause budget just silently
+        // disables the source after 10 pointless retries. Skip the term; the batch stamp below
+        // backs it off to the hunt's cadence, and it self-heals the moment the criteria is fixed.
         let nativeParams: unknown;
         try {
           nativeParams = translator(hunt, terms);
         } catch (translateErr) {
+          if (translateErr instanceof TranslatorNotReadyError) {
+            logger.warn(
+              { huntId: hunt.id, sourceId, terms },
+              'Translator module still loading — retrying batch next tick',
+            );
+            translatorNotReady = true;
+            break;
+          }
           logger.error(
             { huntId: hunt.id, sourceId, terms, err: translateErr },
             'Search skipped: criteria/translation error (config — not a transient failure). ' +
               'Not counted toward auto-pause; fix the hunt criteria. Will retry next poll.',
           );
-          state.lastSearchTime.set(key, Date.now());
           continue;
         }
 
@@ -381,7 +427,6 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
               if (paused) {
                 logger.warn({ huntId: hunt.id, sourceId }, 'Source auto-paused due to repeated failures (errors with zero listings)');
               }
-              state.lastSearchTime.set(key, Date.now());
               continue;
             }
           }
@@ -391,7 +436,30 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
           );
 
           clearSourceFailures(state, db, hunt.id, sourceId, terms);
-          state.lastSearchTime.set(key, Date.now());
+
+          // Silently-dead search guard: some sources return 0 results — not an
+          // error — for an invalid filter value (e.g. AutoTrader model names
+          // must match their catalogue exactly: "Polestar 2", not "2"). Warn
+          // into the hunt's activity log once, when the streak first crosses
+          // the threshold; a later successful result resets the streak so the
+          // guard re-arms if the search goes dead again.
+          if (outcome.listings.length === 0 && outcome.errors.length === 0) {
+            const streak = getZeroResultStreak(db, hunt.id, sourceId, terms);
+            if (streak === ZERO_RESULT_WARN_STREAK) {
+              logger.warn(
+                { huntId: hunt.id, sourceId, terms, streak },
+                'Search has returned zero results on consecutive polls — check criteria filter values',
+              );
+              logHuntWarning(
+                db,
+                hunt.id,
+                `Search "${terms}" on ${sourceId} returned 0 results for ${streak} consecutive polls. ` +
+                  'If listings exist on the source, a criteria filter value is probably invalid — ' +
+                  'e.g. AutoTrader model names must match their catalogue exactly ("Polestar 2", not "2"). ' +
+                  'Verify with a make-only recon search and fix criteria.targets.',
+              );
+            }
+          }
 
           // Issue 3: for sources that need detail fetches, enrich new listings.
           if (adapter.capabilities.needsDetailFetch && adapter.fetchDetail && newSourceIds.length > 0) {
@@ -412,6 +480,10 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
                 if (!detail.error && detail.listing) {
                   // Merge enriched attributes onto the offer row (don't replace search-level fields).
                   mergeOfferAttributes(db, sourceId, listingSourceId, detail.listing.attributes);
+                  // Jev must-have verdicts (shadow mode, handoff #2): stored for the dashboard and
+                  // the evaluator to read; nothing is dismissed. No-op when JEV_ENABLED=0.
+                  const enriched = getOfferBySourceId(db, sourceId, listingSourceId);
+                  if (enriched) await shadowMustHaveChecks(db, hunt, enriched);
                 } else if (detail.error) {
                   logger.warn({ sourceId, listingSourceId, error: detail.error }, 'fetchDetail returned error');
                 }
@@ -447,15 +519,17 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
           if (paused) {
             logger.warn({ huntId: hunt.id, sourceId }, 'Source auto-paused due to repeated failures');
           }
-          // Advance lastSearchTime even on a thrown search, for parity with every other
-          // outcome branch (success, zero-listings-with-errors, config/translate error).
-          // Without this a transiently-failing source (network/429/5xx) would stay eligible
-          // every 30s tick — ignoring the hunt's poll cadence — until it accrued 10 failures.
-          // Now it backs off to max(cadence, cool-down). recordSourceFailure still runs above,
-          // so the transient failure is still counted toward auto-pause; and the cool-down
-          // probe logic is unaffected (isSourcePaused gates separately on sourcePausedAt).
-          state.lastSearchTime.set(key, Date.now());
+          // The batch stamp below advances the cadence key regardless, so a transiently-failing
+          // term (network/429/5xx) backs off to the hunt's cadence rather than retrying every
+          // 30s tick. recordSourceFailure still counts it toward auto-pause; the cool-down probe
+          // logic is unaffected (isSourcePaused gates separately on sourcePausedAt).
         }
+      }
+
+      // Stamp the batch as run (every term got its chance this poll). Skipped only for the
+      // translator startup race, where nothing was searched and the next tick retries.
+      if (!translatorNotReady) {
+        state.lastSearchTime.set(cadenceKey, Date.now());
       }
     }
   }
@@ -515,16 +589,31 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
     state.lastDrainTime = Date.now();
   }
 
-  // --- Watch polls ---
-  if (Date.now() - state.lastWatchPollTime < WATCH_CADENCE_MS) return;
+  // --- Watch polls (per-vertical cadence) ---
+  // Cadence comes from the vertical's watch_poll_minutes (verticals.yml); verticals without one
+  // use the global WATCH_CADENCE_MS default. Slow-moving verticals (cars: daily) stop burning
+  // source calls and change-notifications 12×/day, while auction-driven sources keep the tighter
+  // default for graduated ending alerts.
+  const watchCadenceMsFor = (vertical: string | null): number => {
+    if (vertical) {
+      try {
+        const minutes = getVertical(vertical).watch_poll_minutes;
+        if (typeof minutes === 'number' && minutes > 0) return minutes * 60_000;
+      } catch {
+        // Unknown vertical — fall through to the global default
+      }
+    }
+    return WATCH_CADENCE_MS;
+  };
+  const watchedOffers = getWatchedOffers(db).filter((offer) => {
+    const last = state.lastWatchPollTime.get(offer.vertical ?? '') ?? state.startedAt;
+    return Date.now() - last >= watchCadenceMsFor(offer.vertical);
+  });
+  const dueWatchVerticals = new Set(watchedOffers.map((o) => o.vertical ?? ''));
 
-  const watchedOffers = getWatchedOffers(db);
-  if (watchedOffers.length === 0) {
-    state.lastWatchPollTime = Date.now();
-    return;
+  if (watchedOffers.length > 0) {
+    logger.info({ count: watchedOffers.length, verticals: [...dueWatchVerticals] }, 'Starting watch poll');
   }
-
-  logger.info({ count: watchedOffers.length }, 'Starting watch poll');
 
   for (const offer of watchedOffers) {
     const sourceId = offer.source;
@@ -585,7 +674,8 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
       const auctionChanges = changes.filter((c) => c.type === 'auction_ending');
       const watchConditionChanges = changes.filter((c) => c.type === 'watch_condition_met');
 
-      if (priceChanges.length > 0) {
+      // A watch-condition hit already carries the price; don't also spawn a price-change run.
+      if (priceChanges.length > 0 && watchConditionChanges.length === 0) {
         const huntIds = getHuntIdsForOffer(db, offer.id);
         for (const huntId of huntIds) {
           const hunt = getHunt(db, huntId);
@@ -632,7 +722,9 @@ export async function tick(state: SchedulerState, db: Database.Database): Promis
     }
   }
 
-  state.lastWatchPollTime = Date.now();
+  for (const vertical of dueWatchVerticals) {
+    state.lastWatchPollTime.set(vertical, Date.now());
+  }
 
   // --- Staleness sweep (check unwatched offers that haven't appeared in searches recently) ---
   if (Date.now() - state.lastStalenessSweepTime < STALENESS_SWEEP_CADENCE_MS) return;

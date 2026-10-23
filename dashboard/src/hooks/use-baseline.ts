@@ -4,7 +4,9 @@ import { apiGet } from '@/lib/api';
 import { queryKeys } from '@/lib/query-keys';
 import {
   matchToSegment,
+  offerMatchText,
   assessPrice,
+  type MatchableOffer,
   type SegmentMatch,
   type BaselineAssessment,
 } from '@/lib/segment-matcher';
@@ -13,10 +15,10 @@ import type { HuntBaselineData, SegmentWithStats } from '@shared/types';
 export interface BaselineContext {
   segments: SegmentWithStats[];
   isLoading: boolean;
-  match: (title: string) => SegmentMatch | null;
-  assess: (price: number | null, title: string) => BaselineAssessment | null;
+  match: (offer: MatchableOffer) => SegmentMatch | null;
+  assess: (price: number | null, offer: MatchableOffer) => BaselineAssessment | null;
   belowBaselineCount: (
-    offers: Array<{ title: string; current_price: number | null }>,
+    offers: Array<MatchableOffer & { current_price: number | null }>,
   ) => number;
   isStale: boolean;
   hasSegments: boolean;
@@ -37,21 +39,21 @@ export function useBaseline(huntId: number | null): BaselineContext {
   const segments = data?.segments ?? [];
 
   const match = useCallback(
-    (title: string) => matchToSegment(title, segments),
+    (offer: MatchableOffer) => matchToSegment(offerMatchText(offer), segments),
     [segments],
   );
 
   const assess = useCallback(
-    (price: number | null, title: string) => {
-      const m = matchToSegment(title, segments);
+    (price: number | null, offer: MatchableOffer) => {
+      const m = matchToSegment(offerMatchText(offer), segments);
       return assessPrice(price, m?.segment ?? null);
     },
     [segments],
   );
 
   const belowBaselineCount = useCallback(
-    (offers: Array<{ title: string; current_price: number | null }>) => {
-      return offers.filter((o) => assess(o.current_price, o.title) === 'good').length;
+    (offers: Array<MatchableOffer & { current_price: number | null }>) => {
+      return offers.filter((o) => assess(o.current_price, o) === 'good').length;
     },
     [assess],
   );

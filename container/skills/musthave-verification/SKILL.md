@@ -31,12 +31,19 @@ For the hunt: `criteria.intent.must_have` (the features) × `criteria.targets` (
    - **verified** — a source confirms the feature is available on the model in a way that satisfies the brief (standard, or an option that listings expose so the evaluator can confirm per-car).
    - **contradicted** — a source shows the claim as stated is wrong (e.g. "standard" but it's actually the optional Pilot Pack; or not offered at all on the relevant years).
    - **unverified** — sources are silent or conflict and you genuinely can't tell. Prefer this over a guess.
+   - **AMBIGUOUS wording (loop back, do not resolve it yourself).** If you find the must-have *as
+     written* is satisfied by a weaker tier than the brief evidently wants (e.g. "Lane Keep Assist or
+     Lane Centering" is met by warning-only LKA on every car, while the notes demand Pilot Pack), or
+     you catch yourself writing "X alone satisfies the wording", that is a question for the user, not
+     a reading for you to pick. Record `unverified` with `notes` starting `AMBIGUOUS:` — state the two
+     readings, which one the sources support on this model, and a proposed rewording of the must-have
+     that names the tier. The gate blocks on it and the orchestrator puts it to the user.
 4. **Record each verdict** — `mcp__deal-hunter-db__record_claim_verification` with `hunt_id`, the exact `target_key`, the exact `feature` string, `verdict`, `evidence_url`, and a short `notes` of what the source said. Upserts, so re-running only the failures is safe.
 
 ## Rules
 
 - **Verify every pair.** Partial coverage leaves the gate blocked — and a skipped pair is exactly where a bad claim hides.
-- **Match the exact strings.** `target_key` must equal the `criteria.targets` key and `feature` must equal the `must_have` entry verbatim, or the gate won't match the verdict to the requirement.
+- **Match the exact strings.** `target_key` must equal the `criteria.targets` key and `feature` must equal the `must_have` entry verbatim, or the gate won't match the verdict to the requirement. The same verbatim strings are reused per-offer by the evaluators (`record_evaluation.requirement_checks`), so never reword a must_have — editing the criteria string orphans every verdict recorded against it.
 - **Cite everything.** A `verified` or `contradicted` verdict needs an `evidence_url`. No URL ≈ no verification.
 - **Never invent a verdict.** Honest `unverified` is more useful than false confidence — it tells the user (and the gate) exactly what couldn't be pinned down. If a must-have genuinely can't be confirmed online, that's for the user to waive (`waive_must_have`), not for you to wave through.
 - **Don't activate the hunt.** Your output is verdicts; activation is the orchestrator's call once the gate is satisfied.

@@ -18,6 +18,19 @@ import type { Hunt } from '../db.js';
  */
 export type TranslatorFn = (hunt: Hunt, terms: string) => unknown;
 
+/**
+ * Thrown when a translator's lazily-imported module hasn't finished loading
+ * yet (a startup race, not a criteria error). The scheduler must treat this
+ * as transient — retry on the next tick — NOT back off to the hunt's cadence,
+ * or a daily-cadence vertical loses its first due search after every restart.
+ */
+export class TranslatorNotReadyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TranslatorNotReadyError';
+  }
+}
+
 const registry = new Map<string, TranslatorFn>();
 
 /** Register a translator for the given vertical/source pair. */
@@ -84,7 +97,9 @@ const carsAutotraderTranslator: TranslatorFn = (hunt, terms) => {
   // scheduler to skip — it will succeed on the next tick once loadCarsAtTranslator
   // has been awaited. In practice, we eagerly pre-load it below.
   if (_carsAtTranslator === undefined) {
-    throw new Error('cars/autotrader translator: module not yet loaded — will retry next tick');
+    throw new TranslatorNotReadyError(
+      'cars/autotrader translator: module not yet loaded — will retry next tick',
+    );
   }
 
   // `terms` selects which candidate model (criteria.targets[terms]) this search

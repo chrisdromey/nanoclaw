@@ -23,6 +23,9 @@ import EbayConditionBadge from '@/components/source-specific/EbayConditionBadge'
 import ViewOnSourceLink from '@/components/source-specific/ViewOnSourceLink';
 import CarAttributesBlock from '@/components/source-specific/CarAttributesBlock';
 import MustHaveChips from '@/components/verticals/cars/MustHaveChips';
+import RequirementChecks from '@/components/RequirementChecks';
+import JevChecks from '@/components/JevChecks';
+import { getVerticalUI } from '@/lib/verticals/registry';
 import { parseCarAttributes, parseFeatures } from '@/lib/attributes';
 import type { CarAttributes, HuntTargetsData, TargetInfo } from '@shared/types';
 import {
@@ -104,14 +107,16 @@ export default function OfferDetail() {
 
   const { match, assess } = useBaseline(primaryHuntId);
 
-  // Cars offers: hunt targets for must-have chips + "Spec sheet →" link.
-  // Uses primaryHuntId (prefers non-dismissed associations) so the must-haves
-  // shown belong to the same hunt as the market context. Skips silently when
-  // the offer has no hunt associations.
+  // Must-have verticals: hunt targets for must-have chips + "Spec sheet →"
+  // link. Uses primaryHuntId (prefers non-dismissed associations) so the
+  // must-haves shown belong to the same hunt as the market context. Skips
+  // silently when the offer has no hunt associations.
   const { data: targetsData } = useQuery({
     queryKey: queryKeys.hunts.targets(primaryHuntId!),
     queryFn: () => apiGet<HuntTargetsData>(`/hunts/${primaryHuntId}/targets`),
-    enabled: offer?.vertical === 'cars' && primaryHuntId != null,
+    enabled:
+      getVerticalUI(offer?.vertical).supportsMustHaveVerification &&
+      primaryHuntId != null,
   });
 
   if (!offer) {
@@ -148,8 +153,8 @@ export default function OfferDetail() {
     timestamp: p.observed_at,
   })) ?? [];
 
-  const segMatch = match(offer.title);
-  const assessment = assess(currentPrice, offer.title);
+  const segMatch = match(offer);
+  const assessment = assess(currentPrice, offer);
 
   const handleToggleWatch = async () => {
     if (!primaryHuntId) return;
@@ -347,11 +352,21 @@ export default function OfferDetail() {
         <CarAttributesBlock attributes={offer.attributes ?? {}} source={offer.source} />
       )}
 
-      {/* Must-haves — cars vertical only, needs hunt targets */}
-      {offer.vertical === 'cars' && targetsData && targetsData.must_have.length > 0 && (() => {
+      {/* Must-haves — verticals with must-have verification only. Prefers the
+          latest evaluation's recorded requirement verdicts; falls back to the
+          fuzzy feature-match heuristic (MustHaveChips) when none recorded. */}
+      {getVerticalUI(offer.vertical).supportsMustHaveVerification && (() => {
+        // Evaluations are ordered newest-first by the API.
+        const latestChecks = offer.evaluations[0]?.requirement_checks;
+        const hasRecordedChecks = latestChecks != null && latestChecks.length > 0;
+        const jevChecks = offer.jev_checks ?? [];
+        if (!hasRecordedChecks && !(targetsData && targetsData.must_have.length > 0) && jevChecks.length === 0) {
+          return null;
+        }
         const carAttrs = parseCarAttributes(offer.attributes ?? {});
-        const features = parseFeatures(offer.attributes ?? {});
-        const targetKey = resolveOfferTarget(carAttrs, offer.title, targetsData.targets);
+        const targetKey = targetsData
+          ? resolveOfferTarget(carAttrs, offer.title, targetsData.targets)
+          : null;
         return (
           <div className="bg-surface border border-zinc-800 rounded-lg p-4 mb-6">
             <div className="flex items-center justify-between mb-3">
@@ -365,11 +380,20 @@ export default function OfferDetail() {
                 </Link>
               )}
             </div>
-            <MustHaveChips
-              mustHaves={targetsData.must_have}
-              features={features}
-              mode="full"
-            />
+            {hasRecordedChecks ? (
+              <RequirementChecks checks={latestChecks} mode="full" />
+            ) : targetsData && targetsData.must_have.length > 0 ? (
+              <MustHaveChips
+                mustHaves={targetsData.must_have}
+                features={parseFeatures(offer.attributes ?? {})}
+                mode="full"
+              />
+            ) : null}
+            {jevChecks.length > 0 && (
+              <div className={cn(hasRecordedChecks || targetsData ? 'mt-4 pt-4 border-t border-zinc-800' : '')}>
+                <JevChecks checks={jevChecks} />
+              </div>
+            )}
           </div>
         );
       })()}
@@ -635,6 +659,11 @@ export default function OfferDetail() {
                   </div>
                   {ev.reasoning && (
                     <p className="text-xs text-zinc-400 mt-1">{ev.reasoning}</p>
+                  )}
+                  {ev.requirement_checks && ev.requirement_checks.length > 0 && (
+                    <div className="mt-2">
+                      <RequirementChecks checks={ev.requirement_checks} mode="full" />
+                    </div>
                   )}
                 </div>
               ))}

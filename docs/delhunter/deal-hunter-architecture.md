@@ -146,3 +146,4 @@ rebuild + cache clear; schema/cadence changes require the watcher rebuild + rest
 
 - [multi-vertical-rollout.md](multi-vertical-rollout.md) — the original rollout changelog (cars/AutoTrader).
 - [deal-hunter-addendum-hunt-files.md](deal-hunter-addendum-hunt-files.md) — hunt file conventions.
+- [jev-integration-handoff.md](jev-integration-handoff.md) — plan for moving judgment-only steps (re-evaluation gate, must-have checks, pass-1 triage) to TypeSafe Jev; measured spend breakdown and ranked substitution points.

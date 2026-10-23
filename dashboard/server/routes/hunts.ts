@@ -200,9 +200,18 @@ huntRoutes.get('/hunts/:id/evaluations', (c) => {
       ORDER BY e.evaluated_at DESC
       LIMIT 100`,
     )
-    .all(id);
+    .all(id) as Record<string, unknown>[];
 
-  return c.json(evaluations);
+  // Parse the JSON `requirement_checks` column to an array (null stays null).
+  const parsed = evaluations.map((row) => ({
+    ...row,
+    requirement_checks: parseJsonField<unknown[] | null>(
+      row.requirement_checks as string | null,
+      null,
+    ),
+  }));
+
+  return c.json(parsed);
 });
 
 // Alerts for a hunt

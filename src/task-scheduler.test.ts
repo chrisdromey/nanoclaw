@@ -326,7 +326,10 @@ describe('shouldSkipDealHunterTask (hunt pause gate)', () => {
 
   it('never gates once-tasks (user reminders mentioning deal hunter survive)', () => {
     seedHuntDb([{ id: 1, status: 'paused', monitoring: 0 }]);
-    const task = makeTask('Remind me to resume the Deal Hunter hunts. hunt_id=1', 'reminder-1');
+    const task = makeTask(
+      'Remind me to resume the Deal Hunter hunts. hunt_id=1',
+      'reminder-1',
+    );
     task.schedule_type = 'once';
     expect(shouldSkipDealHunterTask(task)).toBeNull();
   });

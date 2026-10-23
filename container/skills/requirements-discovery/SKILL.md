@@ -33,7 +33,17 @@ description: >
 2. Identify the underlying requirement, not just the product mentioned
 3. Get the essentials: budget range and hard must-haves (the things that would make a listing
    an automatic reject). Two or three constraints max at this stage — don't try to nail down
-   everything.
+   everything. Hard must-haves ultimately land in the hunt's `criteria.intent.must_have` (the
+   cross-vertical canonical home — every verification layer keys on those exact strings), so
+   phrase each as one testable requirement.
+   **Name the level, not just the feature.** Many features are sold at more than one tier under
+   similar names (warning-only lane keep vs lane centering that steers; cruise vs adaptive cruise;
+   "self driving" vs a lane-keep nudge). If the user's words could cover more than one tier, ask
+   which they mean *before* writing the must-have, then write the answer into the string itself:
+   `"<what the buyer gets> (<manufacturer names for it>), not <the weaker tier>"`. A slash or "or"
+   joining two feature names inside one must-have is a smell — it is almost always a synonym (name
+   the stronger one) rather than a genuine either. Every verifier and evaluator quotes the string
+   verbatim, so the disambiguation travels with it for free.
 4. **Search the market immediately.** Before refining further, run reconnaissance using the
    vertical's `recon_tool` with broad terms reflecting the need, following the vertical's
    `sourcing_skill` for how to search it well. This is market reconnaissance, not a formal

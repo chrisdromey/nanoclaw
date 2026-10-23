@@ -6,11 +6,12 @@
  * source for an existing vertical adds nothing.
  */
 
-import type { ComponentType } from 'react';
+import type { ComponentType, ReactNode } from 'react';
 import type {
   CarAttributes,
   HuntBaselineData,
   NormalisedFeatureCategory,
+  OfferWithPrices,
   SegmentWithStats,
 } from '@shared/types';
 import { carsVerticalUI } from './cars';
@@ -40,6 +41,17 @@ export interface MarketExtraPanelProps {
   offersBySegment: Map<number, ParsedBaselineOffer[]>;
 }
 
+/**
+ * Per-vertical metadata columns for the hunt offers table (OffersTab) —
+ * rendered between the shared price/change columns and the auction/decision
+ * columns. `renderCells` must emit exactly one <td> per header, matching the
+ * header order.
+ */
+export interface OfferTableColumns {
+  headers: Array<{ key: string; label: string }>;
+  renderCells: (offer: OfferWithPrices) => ReactNode;
+}
+
 export interface VerticalUI {
   key: string;
   /** Which deal signal leads the summary strip and offer annotations. */
@@ -56,6 +68,8 @@ export interface VerticalUI {
   SegmentAnalyticsPanel?: ComponentType<SegmentAnalyticsPanelProps>;
   /** Rendered once on the Market tab when provided. */
   MarketExtraPanel?: ComponentType<MarketExtraPanelProps>;
+  /** Vertical-specific offers-table columns (default: Condition/Format). */
+  offerTableColumns?: OfferTableColumns;
 }
 
 /**
@@ -71,6 +85,26 @@ const defaultVerticalUI: VerticalUI = Object.freeze({
   supportsSourcePriceOpinion: false,
   supportsMustHaveVerification: false,
   supportsSpecExplorer: false,
+  offerTableColumns: {
+    headers: [
+      { key: 'condition', label: 'Condition' },
+      { key: 'format', label: 'Format' },
+    ],
+    renderCells: (offer: OfferWithPrices) => (
+      <>
+        <td className="py-2.5 px-3 text-zinc-400 text-xs">
+          {offer.condition || '—'}
+        </td>
+        <td className="py-2.5 px-3 text-zinc-400 text-xs">
+          {offer.buying_format?.includes('AUCTION')
+            ? 'Auc.'
+            : offer.buying_format?.includes('FIXED')
+              ? 'BIN'
+              : offer.buying_format || '—'}
+        </td>
+      </>
+    ),
+  },
 });
 
 const registry: Record<string, VerticalUI> = {

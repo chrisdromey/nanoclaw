@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getDealDb } from '../db.js';
 import { checkOfferStatusBySource, pendingRefreshJobs } from '../sources/index.js';
+import { parseJsonField } from '../parse.js';
 import { randomUUID } from 'crypto';
 
 /**
@@ -12,11 +13,6 @@ import { randomUUID } from 'crypto';
  * Entry is removed when the job settles.
  */
 const activeRefreshByOffer = new Map<number, { refreshId: string; promise: Promise<{ status: string; error?: string }> }>();
-
-function parseJsonField<T>(value: string | null | undefined, fallback: T): T {
-  if (!value) return fallback;
-  try { return JSON.parse(value) as T; } catch { return fallback; }
-}
 
 export const offerRoutes = new Hono();
 
@@ -42,10 +38,15 @@ offerRoutes.get('/watched', (c) => {
 
   // Parse the JSON `attributes` column so the frontend receives an object
   // (cars Year/Mileage columns) rather than a raw JSON string. Matches the
-  // single-offer endpoint below.
+  // single-offer endpoint below. `watch_conditions` likewise (price keys +
+  // optional verify_required list); null stays null.
   const offers = rows.map((row) => ({
     ...row,
     attributes: parseJsonField(row.attributes as string | null, {}),
+    watch_conditions: parseJsonField<Record<string, unknown> | null>(
+      row.watch_conditions as string | null,
+      null,
+    ),
   }));
 
   return c.json(offers);
@@ -76,7 +77,16 @@ offerRoutes.get('/offers/:id', (c) => {
       WHERE e.offer_id = ?
       ORDER BY e.evaluated_at DESC`,
     )
-    .all(id);
+    .all(id) as Record<string, unknown>[];
+
+  // Parse the JSON `requirement_checks` column to an array (null stays null).
+  const parsedEvaluations = evaluations.map((row) => ({
+    ...row,
+    requirement_checks: parseJsonField<unknown[] | null>(
+      row.requirement_checks as string | null,
+      null,
+    ),
+  }));
 
   const alerts = db
     .prepare(
@@ -88,13 +98,36 @@ offerRoutes.get('/offers/:id', (c) => {
     )
     .all(id);
 
+  // Jev must-have verdicts (watcher shadow mode). The table is created by the watcher's
+  // ensureSchema(); tolerate its absence on a DB the watcher hasn't migrated yet.
+  let jevChecks: Record<string, unknown>[] = [];
+  try {
+    jevChecks = (
+      db
+        .prepare(
+          `SELECT c.*, h.name as hunt_name
+          FROM offer_requirement_checks c
+          JOIN hunts h ON h.id = c.hunt_id
+          WHERE c.offer_id = ?
+          ORDER BY c.hunt_id, c.rowid`,
+        )
+        .all(id) as Record<string, unknown>[]
+    ).map((row) => ({
+      ...row,
+      probabilities: parseJsonField<unknown[]>(row.probabilities as string | null, []),
+    }));
+  } catch {
+    jevChecks = [];
+  }
+
   const offerRow = offer as Record<string, unknown>;
   return c.json({
     ...offerRow,
     attributes: parseJsonField(offerRow.attributes as string | null, {}),
     hunt_associations: huntAssociations,
-    evaluations,
+    evaluations: parsedEvaluations,
     alerts,
+    jev_checks: jevChecks,
   });
 });
 

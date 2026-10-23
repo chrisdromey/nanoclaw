@@ -60,11 +60,11 @@ For each offer, decide:
 - **WATCH** — price-watching candidate: interesting spec/price but not a clear deal yet; enable monitoring
 - **SKIP** — overpriced, wrong spec, or below minimum quality threshold
 
-Record every decision: `mcp__deal-hunter-db__record_evaluation`.
+Record every decision: `mcp__deal-hunter-db__record_evaluation`. If the hunt's `criteria.intent.must_have` is non-empty, verify each entry against this listing's evidence first and pass the verdicts as `requirement_checks` — `verified` / `contradicted` / `unverified` (never a guess), with the `must_have` strings quoted **verbatim**. ALERT on such a hunt requires a check for every must-have and is refused if any is `contradicted`.
 
 For ALERT: also call `mcp__deal-hunter-db__record_alert`.
 
-For WATCH: call `mcp__deal-hunter-db__update_offer` with `watching: true` and `watch_conditions` JSON, e.g. `{"alert_if_price_below_gbp": 200}`.
+For WATCH: call `mcp__deal-hunter-db__update_offer` with `watching: true` and `watch_conditions` JSON, e.g. `{"alert_if_price_below_gbp": 200}` (canonical keys: `alert_if_price_below_gbp`, `max_price`; `verify_required` is auto-populated by `record_evaluation` — anything else is ignored by the watcher).
 
 ## Notification format
 
