@@ -357,3 +357,48 @@ if (process.env.LIVE === '1') {
     }, 30000);
   });
 }
+
+// ─── expired-advert redirect ─────────────────────────────────────────────────
+// AutoTrader 301-redirects expired adverts to /search-form?expired-ad=true instead of
+// returning 404. fetch follows the redirect, so the response is a 200 search form.
+
+describe('expired-advert redirect', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stubRedirectedFetch() {
+    vi.stubGlobal('fetch', vi.fn(async () =>
+      new Response('<html><title>Search</title></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }),
+    ));
+    // Response.url/redirected are read-only; emulate the followed redirect.
+    const orig = (globalThis.fetch as ReturnType<typeof vi.fn>).getMockImplementation()!;
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockImplementation(async (...args: unknown[]) => {
+      const res = await (orig as (...a: unknown[]) => Promise<Response>)(...args);
+      Object.defineProperty(res, 'redirected', { value: true });
+      Object.defineProperty(res, 'url', { value: 'https://www.autotrader.co.uk/search-form?expired-ad=true' });
+      return res;
+    });
+  }
+
+  it('getListingState reports removed (not an error) when redirected off /car-details/', async () => {
+    const { _resetStateForTest } = await import('./rate-limit.js');
+    _resetStateForTest({ lastCallAt: 0, backoffUntil: 0, backoffStep: 0 });
+    stubRedirectedFetch();
+    const { getListingState } = await import('./detail.js');
+    const result = await getListingState('202606053020825');
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe('removed');
+  });
+
+  it('fetchDetailPage reports the advert as gone when redirected off /car-details/', async () => {
+    const { _resetStateForTest } = await import('./rate-limit.js');
+    _resetStateForTest({ lastCallAt: 0, backoffUntil: 0, backoffStep: 0 });
+    stubRedirectedFetch();
+    const { fetchDetailPage } = await import('./detail.js');
+    const result = await fetchDetailPage('202606053020825');
+    expect(result.listing).toBeNull();
+    expect(result.error).toMatch(/expired/i);
+  });
+});

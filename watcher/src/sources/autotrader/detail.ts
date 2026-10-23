@@ -353,6 +353,19 @@ export function mergeDetailAttributes(
 }
 
 /**
+ * AutoTrader 301-redirects expired adverts to /search-form?expired-ad=true (not a 404).
+ * fetch follows the redirect, so the only trace is the final response URL.
+ */
+function isExpiredRedirect(res: Response): boolean {
+  if (!res.redirected) return false;
+  try {
+    return !new URL(res.url).pathname.startsWith('/car-details/');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Fetch the detail page and enrich a listing.
  * Returns a DetailOutcome with the enriched listing or an error.
  */
@@ -369,8 +382,8 @@ export async function fetchDetailPage(advertId: string): Promise<DetailOutcome> 
     return { listing: null, apiCalls: 1, error: msg };
   }
 
-  if (res.status === 404) {
-    return { listing: null, apiCalls: 1, error: '404 Not Found' };
+  if (res.status === 404 || isExpiredRedirect(res)) {
+    return { listing: null, apiCalls: 1, error: res.status === 404 ? '404 Not Found' : 'Advert expired (redirected off /car-details/)' };
   }
 
   if (!res.ok) {
@@ -433,7 +446,7 @@ export async function getListingState(advertId: string): Promise<{
     return { status: 'active', priceGbp: null, attributes: {}, apiCalls: 1, error: msg };
   }
 
-  if (res.status === 404) {
+  if (res.status === 404 || isExpiredRedirect(res)) {
     return { status: 'removed', priceGbp: null, attributes: {}, apiCalls: 1 };
   }
 

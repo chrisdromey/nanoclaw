@@ -840,7 +840,10 @@ export function associateOfferWithHunt(
 }
 
 export function updateOfferStatus(db: Database.Database, offerId: number, status: string): void {
-  db.prepare("UPDATE offers SET status = ?, last_status_change = datetime('now') WHERE id = ?").run(status, offerId);
+  // A gone listing can't be watched — clearing it keeps dead offers out of every watched list.
+  db.prepare(
+    "UPDATE offers SET status = ?, last_status_change = datetime('now'), watching = CASE WHEN ? = 'active' THEN watching ELSE 0 END WHERE id = ?",
+  ).run(status, status, offerId);
 }
 
 export function getNotifiedThresholds(db: Database.Database, offerId: number): number[] {
