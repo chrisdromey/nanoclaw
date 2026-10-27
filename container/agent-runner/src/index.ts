@@ -20,6 +20,7 @@ import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-a
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 import { buildEvaluatorAgents } from './vertical-agents.js';
+import { MODEL, EVALUATOR_MODEL } from './models.js';
 import {
   AUTOTRADER_SEARCH_TOOLS,
   DEAL_HUNTER_DB_TOOLS,
@@ -516,7 +517,7 @@ If something fails, say so — don't retry silently. Say what went wrong and wha
       cwd: '/workspace/group',
       // Orchestrator runs on sonnet: it routes/dispatches and handles interactive chat, while the
       // judgment-heavy work is delegated to sub-agents (also sonnet). Opus isn't needed for routing.
-      model: 'sonnet',
+      model: MODEL,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -661,7 +662,7 @@ Key rules:
             ...(ebayAccessToken ? mcpToolNames('ebay-search', EBAY_SEARCH_TOOLS) : []),
             ...(process.env.EBAY_CLIENT_ID ? mcpToolNames('ebay-api', EBAY_API_TOOLS) : []),
           ],
-          model: 'sonnet',
+          model: EVALUATOR_MODEL,
           skills: ['price-baselining', 'ebay-sourcing', 'cars-sourcing', 'car-spec-research'],
           mcpServers: [
             'deal-hunter-db',
@@ -692,7 +693,7 @@ Key rules:
             'TodoWrite',
             ...mcpToolNames('deal-hunter-db', DEAL_HUNTER_DB_TOOLS),
           ],
-          model: 'sonnet',
+          model: EVALUATOR_MODEL,
           skills: ['musthave-verification'],
           mcpServers: ['deal-hunter-db'],
         },
@@ -712,10 +713,8 @@ Key rules:
             ...mcpToolNames('deal-hunter-db', DEAL_HUNTER_DB_TOOLS),
             ...mcpToolNames('sold-data', SOLD_DATA_TOOLS),
           ],
-          // Haiku: this evaluator is threshold-based (offer price vs sold-comp baseline /
-          // price tier → ALERT/WATCH/SKIP) and serves low-value T1/T2 verticals. The nuanced
-          // intent-triage work lives in the bespoke evaluators, which stay on sonnet.
-          model: 'haiku',
+          // Same model as the other evaluators (was haiku; owner wants evaluation quality).
+          model: EVALUATOR_MODEL,
           skills: ['generic-deal-evaluator'],
           mcpServers: [
             'deal-hunter-db',

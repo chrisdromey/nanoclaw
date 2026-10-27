@@ -8,6 +8,7 @@
 
 import Database from 'better-sqlite3';
 import type { AgentDefinition } from '@anthropic-ai/claude-agent-sdk';
+import { EVALUATOR_MODEL } from './models.js';
 import {
   AUTOTRADER_SEARCH_TOOLS,
   DEAL_HUNTER_DB_TOOLS,
@@ -117,7 +118,7 @@ function evaluatorFromCaps(v: VerticalCaps & { agent: NonNullable<VerticalCaps['
     description: v.agent.description,
     prompt: v.agent.prompt,
     tools,
-    model: 'sonnet',
+    model: EVALUATOR_MODEL,
     skills: [v.evaluator_skill],
     mcpServers: servers,
   };
